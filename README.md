@@ -1,4 +1,4 @@
-# Code and data from 'Initial assembly of the Populus microbiome is temporally dynamic and is determined by selective and stochastic factors'
+# Code and data from 'Initial assembly of the <i>Populus</i> microbiome is temporally dynamic and is determined by selective and stochastic factors'
 
 Nicholas C. Dove<sup>1</sup>, Allison M. Veach<sup>1</sup>, Wellington Muchero<sup>1</sup>, Toni Wahl<sup>1</sup>, James C. Stegen<sup>2</sup>, Christopher W. Schadt<sup>1,3</sup>, and Melissa A. Cregger<sup>1,4</sup>
 
