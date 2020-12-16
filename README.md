@@ -9,7 +9,7 @@ Nicholas C. Dove<sup>1</sup>, Allison M. Veach<sup>1</sup>, Wellington Muchero<s
 
 In Review.
 
-- Raw data can be found in the Sequence Read Archive under project ID <a href="https://www.ncbi.nlm.nih.gov/bioproject/622552">622552</a>.
+- Raw data can be found in the Sequence Read Archive under project ID <a href="http://www.ncbi.nlm.nih.gov/bioproject/685817">685817</a>.
 
 - Or use my pre-made feature, taxonomy, and metadata tables found in this repository
 
