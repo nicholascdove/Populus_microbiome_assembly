@@ -1,0 +1,2331 @@
+---
+title: "Populus Microbiome Assembly"
+author: "Nicholas Dove"
+date: "12/16/2020"
+output: html_document
+---
+
+# Download libraries and set themes
+```{r message=FALSE, warning=FALSE}
+library(ape)
+library(biomformat)
+library(Biostrings)
+library(cowplot)
+library(dplyr)
+library(DESeq2)
+library(ggplot2)
+library(Hmisc)
+library(knitr)
+library(phyloseq)
+library(readxl)
+library(stringr)
+library(vegan)
+library(viridis)
+library(microbiome)
+library(yaml)
+library(metagMisc)
+library(tidyr)
+library(multcompView)
+library(lsmeans)
+library(hillR)
+
+source("SourceTracker.R") # Copied from: https://github.com/danknights/sourcetracker/blob/master/src/SourceTracker.r
+
+theme_set(theme_cowplot())
+
+theme_update(axis.title = element_text(size = 12), axis.text = element_text(size = 10), 
+             legend.title = element_blank(), legend.text = element_text(size = 10), 
+             title = element_text(size = 12))
+```
+
+# Import data
+```{r}
+data_16S <- read_csv2phyloseq(otu.file = "Data/ASV_table_16S_unrarefied.csv", 
+                              taxonomy.file = "Data/taxonomy_table_16S.csv", 
+                              metadata.file = "Data/metadata_table_16S.csv")
+
+data_16S_counts <- data_16S
+data_16S <- transform_sample_counts(data_16S, function(x) x/sum(x))
+data_16S <- prune_taxa(taxa_sums(data_16S) > 0, data_16S)
+
+data_ITS <- read_csv2phyloseq(otu.file = "Data/ASV_table_ITS_unrarefied.csv", 
+                              taxonomy.file = "Data/taxonomy_table_ITS.csv", 
+                              metadata.file = "Data/metadata_table_ITS.csv")
+
+data_ITS_counts <- data_ITS
+data_ITS <- transform_sample_counts(data_ITS_counts, function(x) x/sum(x))
+data_ITS <- prune_taxa(taxa_sums(data_ITS) > 0, data_ITS)
+```
+
+# Rarefaction curve
+```{r}
+# Funciton --------------
+calculate_rarefaction_curves <- function(psdata, measures, depths, parallel=T) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+  require('doParallel')
+
+  # set parallel options if required
+  if (parallel) {
+    paropts  <- list(.packages=c("phyloseq", "reshape2"))
+  } else {
+    paropts  <- NULL
+  }
+
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+
+    molten_alpha_diversity
+  }
+
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive() && ! parallel, 'text', 'none'), .parallel=parallel, .paropts=paropts)
+
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+
+  rarefaction_curve_data
+}
+
+# 16S ----------------------------------------------
+detectCores(all.tests=TRUE)
+
+cl <- makeCluster(detectCores(all.tests=TRUE),setup_strategy = "sequential")
+registerDoParallel(cl)
+
+sample_names(data_16S_counts) <- data_16S_counts@sam_data$SampleName
+
+set.seed(01221990)
+rarefaction_curve_data <- calculate_rarefaction_curves(data_16S_counts, c('Observed'), 
+                                                       rep(c(1, 10, 100, 1000, 2000, 5000, 1:100 * 10000), each = 10))
+
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, 
+                                        Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary %>% mutate(Sample = gsub("[.]", "-", Sample)), 
+                                                data.frame(sample_data(data_16S_counts)), 
+                                                by.x = 'Sample', by.y = 'row.names')
+
+p <- ggplot(rarefaction_curve_data_summary_verbose %>% filter(Measure == "Observed"), 
+       aes(x = Depth, y = Alpha_diversity_mean,  ymin = Alpha_diversity_mean - Alpha_diversity_sd, 
+           ymax = Alpha_diversity_mean + Alpha_diversity_sd, colour = SampleTime, group = Sample)) + 
+  geom_line() + 
+  geom_point(alpha = 0.5) + 
+  labs(color = "Sample time") +
+  scale_x_continuous(trans = "log10", name = "Sequence Depth") +
+  ylab("Richness") +
+  facet_wrap(~Description, scales = 'free') +
+  panel_border() +
+  coord_cartesian(xlim = c(1, 100000)) +
+  theme(legend.title = element_text(size = 12))
+
+# ITS ----------------------
+sample_names(data_ITS_counts) <- data_ITS_counts@sam_data$SampleName
+
+detectCores(all.tests=TRUE)
+
+cl <- makeCluster(detectCores(all.tests=TRUE), setup_strategy = "sequential")
+registerDoParallel(cl)
+
+set.seed(01221990)
+rarefaction_curve_data <- calculate_rarefaction_curves(data_ITS_counts, c('Observed', 'Shannon'), 
+                                                       rep(c(1, 10, 100, 1000, 2000, 5000, 1:100 * 10000), each = 10))
+
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, 
+                                        Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary %>% mutate(Sample = gsub("[.]", "-", Sample)), 
+                                                data.frame(sample_data(data_ITS_counts)), 
+                                                by.x = 'Sample', by.y = 'row.names')
+
+
+p2 <- ggplot(rarefaction_curve_data_summary_verbose %>% filter(Measure == "Observed"), 
+       aes(x = Depth, y = Alpha_diversity_mean,  ymin = Alpha_diversity_mean - Alpha_diversity_sd, 
+           ymax = Alpha_diversity_mean + Alpha_diversity_sd, colour = SampleTime, group = Sample)) + 
+  geom_line() + 
+  geom_point(alpha = 0.5) + 
+  labs(color = "Sample time") +
+  scale_x_continuous(trans = "log10", name = "Sequence Depth") +
+  ylab("Richness") +
+  facet_wrap(~Description, scales = 'free') +
+  panel_border() +
+  coord_cartesian(xlim = c(1, 100000)) +
+  theme(legend.title = element_text(size = 12))
+
+# Combine and export (Figure S1) --------------------------
+prow <- plot_grid(p + theme(legend.position = "none"), p2 + theme(legend.position = "none"), ncol = 1, labels = "AUTO", align = "vh")
+leg <- get_legend(p + theme(legend.justification = 1))
+prow <- plot_grid(prow, leg, ncol = 2, rel_widths = c(1, 0.2))
+
+eps("~/Desktop/BlountCountyAssembly/Output/Figures/Manuscript/Fig_S1.eps", res = 600, height = 7, width = 6.5, units = "in")
+prow
+dev.off()
+```
+
+# Alpha Diversity
+```{r}
+
+####################
+# Rarefy (this can be skipped--just use pre-made rarefied ASV tables)---------------------------------
+################
+
+
+
+# Fix function
+# trace(phyloseq_mult_raref, edit = T)
+# write setup_strategy = "sequential" in  makeCluster
+
+#ps_list <- list()
+#data_16S_counts@sam_data$desc.time <- interaction(data_16S_counts@sam_data$SampleTime, data_16S_counts@sam_data$Description)
+#for(i in levels(as.factor(data_16S_counts@sam_data$desc.time))){
+#  sub <- subset_samples(data_16S_counts, desc.time %in% i)
+#  set.seed(01221990)
+#  x <- phyloseq_mult_raref_avg(sub, SampSize = 900, parallel = T)
+#  otu_table(x) <- round(otu_table(x)*900)
+#  ps_list[[i]] <- x
+#  print(i)
+#}
+#
+#data_16S_counts_900 <- merge_phyloseq(ps_list[[1]]@otu_table, ps_list[[2]]@otu_table, ps_list[[3]]@otu_table, 
+#                                      ps_list[[4]]@otu_table, ps_list[[5]]@otu_table, ps_list[[6]]@otu_table, 
+#                                      ps_list[[7]]@otu_table, ps_list[[8]]@otu_table, ps_list[[9]]@otu_table, 
+#                                      ps_list[[10]]@otu_table, ps_list[[11]]@otu_table, ps_list[[12]]@otu_table)
+#
+#df <- as.data.frame(as(otu_table(data_16S_counts_900), "matrix"))
+#write.csv(df, "ASV_table_16S_rarefied_900.csv")
+#
+#ps_list_ITS <- list()
+#data_ITS_counts@sam_data$desc.time <- interaction(data_ITS_counts@sam_data$SampleTime, data_ITS_counts@sam_data$Description)
+#for(i in levels(as.factor(as.character(data_ITS_counts@sam_data$desc.time)))){
+#  sub <- subset_samples(data_ITS_counts, desc.time %in% i)
+#  set.seed(01221990)
+#  x <- phyloseq_mult_raref_avg(sub, SampSize = 900, parallel = T)
+#  otu_table(x) <- round(otu_table(x)*900)
+#  ps_list_ITS[[i]] <- x
+#  print(i)
+#}
+#
+#data_ITS_counts_900 <- merge_phyloseq(ps_list_ITS[[1]]@otu_table, ps_list_ITS[[2]]@otu_table, ps_list_ITS[[3]]@otu_table, 
+#                                      ps_list_ITS[[4]]@otu_table, ps_list_ITS[[5]]@otu_table, ps_list_ITS[[6]]@otu_table, 
+#                                      ps_list_ITS[[7]]@otu_table, ps_list_ITS[[8]]@otu_table, ps_list_ITS[[9]]@otu_table, 
+#                                      ps_list_ITS[[10]]@otu_table, ps_list_ITS[[11]]@otu_table)
+#
+#df <- as.data.frame(as(otu_table(data_ITS_counts_900), "matrix"))
+#write.csv(df, "ASV_table_ITS_rarefied_900.csv")
+
+
+
+# Start here if using pre-made rarefied ASV tables ----------------
+ASV_16S_900 <- read.csv("ASV_table_16S_rarefied_900.csv", header = T, row.names = 1)
+data_16S_counts_newnames <- data_16S_counts
+sample_names(data_16S_counts_newnames)[!(substr(sample_names(data_16S_counts_newnames), 1, 1) == "E" | 
+                                           substr(sample_names(data_16S_counts_newnames), 1, 1) == "L" | 
+                                            substr(sample_names(data_16S_counts_newnames), 1, 1) == "R")] <- paste0("X", sample_names(data_16S_counts_newnames))
+data_16S_counts_900 <- merge_phyloseq(otu_table(ASV_16S_900, taxa_are_rows = T), data_16S_counts_newnames@tax_table, data_16S_counts_newnames@sam_data)
+data_16S_counts_900 <- prune_taxa(taxa_sums(data_16S_counts_900) > 0, data_16S_counts_900)
+
+# Export this table for null model analysis
+write.csv(t(as.data.frame(as(otu_table(data_16S_counts_900), "matrix"))), "RC_16S_ASV_input.csv.csv")
+write.csv(as.data.frame(as(otu_table(data_16S_counts_900), "matrix")), "comdist_16S_ASV_input.csv")
+
+OTU_ITS_900 <- read.csv("ASV_table_ITS_rarefied_900.csv", row.names = "X")
+data_ITS_counts_newnames <- data_ITS_counts
+sample_names(data_ITS_counts_newnames)[!(substr(sample_names(data_ITS_counts_newnames), 1, 1) == "E" | 
+                                           substr(sample_names(data_ITS_counts_newnames), 1, 1) == "L")] <- paste0("X", sample_names(data_ITS_counts_newnames))
+data_ITS_counts_900 <- merge_phyloseq(otu_table(OTU_ITS_900, taxa_are_rows = T), data_ITS_counts_newnames@tax_table, data_ITS_counts_newnames@sam_data)
+data_ITS_counts_900 <- prune_taxa(taxa_sums(data_ITS_counts_900) > 0.5, data_ITS_counts_900)
+
+OTU_16S <- t(as(data_16S_counts_900@otu_table, "matrix"))
+OTU_16S <- as.data.frame(OTU_16S)
+
+rich_16S <- hill_taxa(OTU_16S, q = 0)
+rich_16S <- merge(data_16S_counts_900@sam_data, rich_16S, by = 0)
+
+shan_16S <- hill_taxa(OTU_16S, q = 1)
+shan_16S <- merge(data_16S_counts_900@sam_data, shan_16S, by = 0)
+
+OTU_ITS <- t(as(data_ITS_counts_900@otu_table, "matrix"))
+OTU_ITS <- as.data.frame(OTU_ITS)
+
+rich_ITS <- hill_taxa(OTU_ITS, q = 0)
+rich_ITS <- merge(data_ITS_counts_900@sam_data, rich_ITS, by = 0)
+
+shan_ITS <- hill_taxa(OTU_ITS, q = 1)
+shan_ITS <- merge(data_ITS_counts_900@sam_data, shan_ITS, by = 0)
+
+
+# Richness 16S ------------------------------------------------------
+model <- aov(y ~ Description*Genotype*SampleTime, rich_16S)
+shapiro.test(resid(model))
+summary(model)
+
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+for(i in levels(rich_16S$Description)){
+  sub <- subset(rich_16S, Description %in% i)
+  model <- aov(y ~ SampleTime*Genotype, sub)
+  x$name <- i
+  x$`p-val.time` <- p.adjust(summary(model)[[1]][[1,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.time <- summary(model)[[1]][[1,"F value"]]
+  x$`p-val.host` <- p.adjust(summary(model)[[1]][[2,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.host <- summary(model)[[1]][[2,"F value"]]
+  x$`p-val.interaction` <- p.adjust(summary(model)[[1]][[3,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.interaction <- summary(model)[[1]][[3,"F value"]]
+  tab <- rbind(tab, x)
+}
+
+
+#Interaction
+for(i in levels(rich_16S$SampleTime)){
+  model <- aov(y ~ Genotype, rich_16S %>% filter(Description == "Leaf Endosphere" & SampleTime %in% i))
+  print(summary(model))
+}
+
+# Shannon 16S -------------------------------------------------
+model <- aov(y ~ Description*Genotype*SampleTime, shan_16S)
+shapiro.test(resid(model))
+summary(model)
+
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+for(i in levels(shan_16S$Description)){
+  sub <- subset(shan_16S, Description %in% i)
+  model <- aov(y ~ SampleTime*Genotype, sub)
+  x$name <- i
+  x$`p-val.time` <- p.adjust(summary(model)[[1]][[1,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.time <- summary(model)[[1]][[1,"F value"]]
+  x$`p-val.host` <- p.adjust(summary(model)[[1]][[2,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.host <- summary(model)[[1]][[2,"F value"]]
+  x$`p-val.interaction` <- p.adjust(summary(model)[[1]][[3,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.interaction <- summary(model)[[1]][[3,"F value"]]
+  tab <- rbind(tab, x)
+  print(TukeyHSD(model, "SampleTime"))
+}
+
+#Interaction
+for(i in levels(shan_16S$SampleTime)){
+  model <- aov(y ~ Genotype, rich_16S %>% filter(Description == "Leaf Endosphere" & SampleTime %in% i))
+  print(summary(model))
+}
+
+# Richness ITS ------------------------------------------------------
+model <- aov(y ~ Description*Genotype*SampleTime, rich_ITS)
+shapiro.test(resid(model))
+summary(model)
+
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+for(i in levels(rich_ITS$Description)){
+  sub <- subset(rich_ITS, Description %in% i)
+  model <- aov(y ~ SampleTime*Genotype, sub)
+  x$name <- i
+  x$`p-val.time` <- p.adjust(summary(model)[[1]][[1,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.time <- summary(model)[[1]][[1,"F value"]]
+  x$`p-val.host` <- p.adjust(summary(model)[[1]][[2,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.host <- summary(model)[[1]][[2,"F value"]]
+  x$`p-val.interaction` <- p.adjust(summary(model)[[1]][[3,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.interaction <- summary(model)[[1]][[3,"F value"]]
+  tab <- rbind(tab, x)
+}
+
+# Shannon ITS ------------------------------------------------------
+model <- aov(y ~ Description*Genotype*SampleTime, shan_ITS)
+shapiro.test(resid(model))
+summary(model)
+
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "F.time", "p-val.time", "F.host", "p-val.host", "F.interaction", "p-val.interaction")
+for(i in levels(shan_ITS$Description)){
+  sub <- subset(shan_ITS, Description %in% i)
+  model <- aov(y ~ SampleTime*Genotype, sub)
+  x$name <- i
+  x$`p-val.time` <- p.adjust(summary(model)[[1]][[1,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.time <- summary(model)[[1]][[1,"F value"]]
+  x$`p-val.host` <- p.adjust(summary(model)[[1]][[2,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.host <- summary(model)[[1]][[2,"F value"]]
+  x$`p-val.interaction` <- p.adjust(summary(model)[[1]][[3,"Pr(>F)"]], method = "fdr", n = 4)
+  x$F.interaction <- summary(model)[[1]][[3,"F value"]]
+  tab <- rbind(tab, x)
+}
+
+# Plot ---------------------------------------------
+rich_16S$Amplicon <- "16S"
+rich_ITS$Amplicon <- "ITS"
+rich <- rbind(rich_16S %>% dplyr::select(Description, y, SampleTime, Amplicon),
+              rich_ITS %>% dplyr::select(Description, y, SampleTime, Amplicon))
+
+letters <- data.frame("Amplicon" = c("16S", "16S", "16S", "16S", "16S", "16S", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS"),
+                      "x" = c(1.7, 2, 2.3, 3.7, 4, 4.3, 0.7, 1, 1.3, 1.7, 2, 2.3, 3.7, 4, 4.3),
+                      "y" = c(390, 360, 260, 390, 480, 530, 215, 115, 90, 140, 170, 170, 100, 150, 200),
+                      "letter" = c("a", "a", "b", "c", "b","a", "a", "b", "b", "b", "a", "a", "c", "b", "a"))
+
+rich %>%
+  group_by(Description, Amplicon, SampleTime) %>%
+  dplyr::summarise(mean = mean(y), se = sd(y)/sqrt(n())) %>%
+  ggplot(aes(x = Description, y = mean, fill = SampleTime)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9), col = "black") +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, position = position_dodge(0.9)) +
+    facet_grid(rows = vars(Amplicon), 
+               labeller = labeller(Amplicon = c("16S" = "Archaea &\nBacteria", "ITS" = "Fungi")),
+               scales = "free") +
+    scale_x_discrete(name = NULL, labels = c("Leaf\nEndosphere", "Leaf\nSurface", "Root\nEndosphere", "Rhizosphere")) +
+    scale_y_continuous(name = bquote(~phantom()^0*italic(D))) +
+    geom_text(data = letters, aes(x = x, y = y, label = letter, vjust = 1), inherit.aes = F) +
+    panel_border() +
+    labs(fill = "Sample Date") +
+    theme(strip.text.y = element_text(size = 12), legend.text = element_text(hjust = 0),
+          legend.title = element_text(size = 12)) +
+    geom_vline(xintercept = c(1.5, 2.5, 3.5), linetype = "dotted") -> p_chao
+
+shan_16S$Amplicon <- "16S"
+shan_ITS$Amplicon <- "ITS"
+shan <- rbind(shan_16S %>% dplyr::select(Description, y, SampleTime, Amplicon),
+              shan_ITS %>% dplyr::select(Description, y, SampleTime, Amplicon))
+
+letters <- data.frame("Amplicon" = c("16S", "16S", "16S", "16S", "16S", "16S", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS", "ITS"),
+                      "x" = c(1.7, 2, 2.3, 3.7, 4, 4.3, 0.7, 1, 1.3, 1.7, 2, 2.3, 3.7, 4, 4.3),
+                      "y" = c(240, 195, 140, 250, 330, 370, 50, 30, 25, 35, 45, 45, 30, 45, 65),
+                      "letter" = c("a", "b", "c", "c", "b","a", "a", "b", "b", "b", "a", "a", "c", "b", "a"))
+
+shan %>%
+  group_by(Description, Amplicon, SampleTime) %>%
+  dplyr::summarise(mean = mean(y), se = sd(y)/sqrt(n())) %>%
+  ggplot(aes(x = Description, y = mean, fill = SampleTime)) +
+    geom_bar(stat = "identity", position = position_dodge(0.9), col = "black") +
+    geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, position = position_dodge(0.9)) +
+    facet_grid(rows = vars(Amplicon), 
+               labeller = labeller(Amplicon = c("16S" = "Archaea &\nBacteria", "ITS" = "Fungi")),
+               scales = "free") +
+    scale_x_discrete(name = NULL, labels = c("Leaf\nEndosphere", "Leaf\nSurface", "Root\nEndosphere", "Rhizosphere")) +
+    scale_y_continuous(name = bquote(~phantom()^1*italic(D))) +
+    geom_text(data = letters, aes(x = x, y = y, label = letter, vjust = 1), inherit.aes = F) +
+    panel_border() +
+    labs(fill = "Sample Date") +
+    theme(strip.text.y = element_text(size = 12), legend.text = element_text(hjust = 0),
+          legend.title = element_text(size = 12)) +
+    geom_vline(xintercept = c(1.5, 2.5, 3.5), linetype = "dotted") -> p_shan
+
+leg <- get_legend(p_chao)
+prow <- plot_grid(p_chao + theme(legend.position = "none"), p_shan + theme(legend.position = "none"), ncol = 1, labels = "AUTO", align = "vh")
+fig.1 <- plot_grid(prow, leg, ncol = 2, rel_widths = c(1, 0.2))
+
+eps("Fig_1.eps", res = 300, height = 5, width = 6.5, units = "in")
+fig.1
+dev.off()
+
+rich_16S %>%
+  ggplot(aes(x = SampleTime, y = y, fill = Genotype)) +
+  geom_boxplot() +
+  facet_wrap(~Description, ncol = 1, scales = "free") +
+  scale_y_continuous(name = bquote(~phantom()^0*italic(D))) +
+  scale_x_discrete(name = NULL) +
+  scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+  geom_vline(xintercept = c(1.5, 2.5), linetype = "dashed") +
+  theme(legend.position = "none") -> p1
+shan_16S %>%
+  ggplot(aes(x = SampleTime, y = y, fill = Genotype)) +
+  geom_boxplot() +
+  facet_wrap(~Description, ncol = 1, scales = "free") +
+  scale_y_continuous(name = bquote(~phantom()^1*italic(D))) +
+  scale_x_discrete(name = NULL) +
+  scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+  geom_vline(xintercept = c(1.5, 2.5), linetype = "dashed") +
+  theme(legend.position = "none") -> p2
+
+leg <- get_legend(p1 + theme(legend.position = "bottom", legend.justification = "center"))
+prow <- plot_grid(p1, p2, labels = "AUTO", align = "vh")
+prow2 <- plot_grid(prow, leg, ncol = 1, rel_heights = c(1, 0.08))
+
+eps("Fig_S2.eps", res = 300, height = 7.5, width = 6.5, units = "in")
+prow2
+dev.off()
+
+rich_ITS %>%
+  ggplot(aes(x = SampleTime, y = y, fill = Genotype)) +
+  geom_boxplot() +
+  facet_wrap(~Description, ncol = 1, scales = "free") +
+  scale_y_continuous(name = bquote(~phantom()^0*italic(D))) +
+  scale_x_discrete(name = NULL) +
+  scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+  geom_vline(xintercept = c(1.5, 2.5), linetype = "dashed") +
+  theme(legend.position = "none") -> p1
+shan_ITS %>%
+  ggplot(aes(x = SampleTime, y = y, fill = Genotype)) +
+  geom_boxplot() +
+  facet_wrap(~Description, ncol = 1, scales = "free") +
+  scale_y_continuous(name = bquote(~phantom()^1*italic(D))) +
+  scale_x_discrete(name = NULL) +
+  scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+  geom_vline(xintercept = c(1.5, 2.5), linetype = "dashed") +
+  theme(legend.position = "none") -> p2
+
+leg <- get_legend(p1 + theme(legend.position = "bottom", legend.justification = "center"))
+prow <- plot_grid(p1, p2, labels = "AUTO", align = "vh")
+prow2 <- plot_grid(prow, leg, ncol = 1, rel_heights = c(1, 0.08))
+
+eps("Fig_S3.eps", res = 300, height = 7.5, width = 6.5, units = "in")
+prow2
+dev.off()
+```
+
+# Beta Diversity
+## 16S
+```{r}
+# Full Model ---------------------------------------------------------
+df_16S <- data.frame(sample_data(data_16S))
+dist_16S <- phyloseq::distance(data_16S, "bray")
+set.seed(12290)
+ad <- adonis(dist_16S ~ Description*HostSpecies*SampleTime, data = df_16S, permutations = 999) 
+ad2 <- adonis(dist_16S ~ Description*Genotype*SampleTime, data = df_16S, permutations = 999) 
+
+# Break apart by plant-associated habitat --------------------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+for(i in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% i) #subset by compartment
+  samp <- data.frame(sub@sam_data) # create sample data matrix
+  dist <- phyloseq::distance(sub, "bray") # create distance matrix
+  set.seed(12290)
+  ad <- adonis(dist ~ SampleTime*HostSpecies, data = samp, permutations = 999) # run permanova
+  x$name <- i # this and below populate the matrix named "x"
+  x$`p-val.time` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 4)
+  x$`p-val.host` <- p.adjust(ad$aov.tab[2,6], method = "fdr", n = 4)
+  x$`p-val.interaction` <- p.adjust(ad$aov.tab[3,6], method = "fdr", n = 4)
+  x$`R^2.time` <- ad$aov.tab[1,5]
+  x$`R^2.host` <- ad$aov.tab[2,5]
+  x$`R^2.interaction` <- ad$aov.tab[3,5]
+  tab <- rbind(tab, x) #concatenate "x" with "tab"
+}
+
+# Look at Leaf Endosphere interaction  -------------
+tab <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(tab) <- c("name", "R^2", "p-val")
+x <- data.frame(matrix(ncol = 3))
+colnames(x) <- c("name", "R^2", "p-val")
+data_16S_LE <- subset_samples(data_16S, Description == "Leaf Endosphere")
+for(i in levels(as.factor(data_16S_LE@sam_data$SampleTime))){
+  sub <- subset_samples(data_16S_LE, SampleTime %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ Genotype, data = samp, permutations = 999) 
+  x$name <- i 
+  x$`p-val` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 3)
+  x$`R^2` <- ad$aov.tab[1,5]
+  tab <- rbind(tab, x) 
+}
+
+# Look at multiple comparisons among genotypes  -------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("niche", "comp1", "comp2", "R^2", "p-val", "p-val.adj")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("niche", "comp1", "comp2", "R^2", "p-val", "p-val.adj")
+for(j in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% j) 
+  cbn <- combn(x = levels(as.factor(sub@sam_data$Genotype)), m = 2)
+
+  for(i in 1:ncol(cbn)){
+   subs <- subset_samples(sub, Genotype %in% cbn[,i])
+   samp <- data.frame(sample_data(subs))
+   dist <- phyloseq::distance(subs, "bray")
+   set.seed(12290)
+   ad <- adonis(dist ~ Genotype, data = samp, permutations = 9999) 
+   x$name <- j
+   x$comp1 <- cbn[1,i]
+   x$comp2 <- cbn[2,i]
+   x$`R^2` <- ad$aov.tab[1,5]
+   x$`p-val` <- ad$aov.tab[1,6]
+   x$`p-val.adj` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = ncol(cbn))
+   tab <- rbind(tab, x)
+   print(j)
+  }
+}
+
+# Gentype differences by host species ------------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+for(i in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ SampleTime*HostSpecies, data = samp, permutations = 999)
+  x$name <- i
+  x$`p-val.time` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 4)
+  x$`p-val.host` <- p.adjust(ad$aov.tab[2,6], method = "fdr", n = 4)
+  x$`p-val.interaction` <- p.adjust(ad$aov.tab[3,6], method = "fdr", n = 4)
+  x$`R^2.time` <- ad$aov.tab[1,5]
+  x$`R^2.host` <- ad$aov.tab[2,5]
+  x$`R^2.interaction` <- ad$aov.tab[3,5]
+  tab <- rbind(tab, x) 
+}
+
+# Gentype differences by septoria resistance----------------------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+for(i in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ SampleTime*Resistance, data = samp, permutations = 999) 
+  x$name <- i
+  x$`p-val.time` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 4)
+  x$`p-val.host` <- p.adjust(ad$aov.tab[2,6], method = "fdr", n = 4)
+  x$`p-val.interaction` <- p.adjust(ad$aov.tab[3,6], method = "fdr", n = 4)
+  x$`R^2.time` <- ad$aov.tab[1,5]
+  x$`R^2.host` <- ad$aov.tab[2,5]
+  x$`R^2.interaction` <- ad$aov.tab[3,5]
+  tab <- rbind(tab, x) 
+}
+
+# Gentype differences by host species and septoria resistance for Spet. Leaf endosphere--------------
+data_16S_LE_Sept <- subset_samples(data_16S, Description == "Leaf Endosphere" & SampleTime %in% c("June", "Sept."))
+samp <- data.frame(data_16S_LE_Sept@sam_data) 
+dist <- phyloseq::distance(data_16S_LE_Sept, "bray") 
+set.seed(12290)
+ad <- adonis(dist ~ HostSpecies, data = samp, permutations = 999) 
+ad <- adonis(dist ~ Resistance, data = samp, permutations = 999) 
+
+# Genotype multiple comparisons for Sept. Leaf Endosphere  -----------------
+tab <- data.frame(matrix(ncol = 5, nrow = 0))
+colnames(tab) <- c("comp1", "comp2", "R^2", "p-val", "p-val.adj")
+x <- data.frame(matrix(ncol = 5))
+colnames(x) <- c("comp1", "comp2", "R^2", "p-val", "p-val.adj")
+cbn <- combn(x = levels(as.factor(data_16S_LE_Sept@sam_data$Genotype)), m = 2)
+for(i in 1:ncol(cbn)){
+  subs <- subset_samples(data_16S_LE_Sept, Genotype %in% cbn[,i])
+  samp <- data.frame(sample_data(subs))
+  dist <- phyloseq::distance(subs, "bray")
+  set.seed(12290)
+  ad <- adonis(dist ~ Genotype, data = samp, permutations = 9999) 
+  x$comp1 <- cbn[1,i]
+  x$comp2 <- cbn[2,i]
+  x$`R^2` <- ad$aov.tab[1,5]
+  x$`p-val` <- ad$aov.tab[1,6]
+  x$`p-val.adj` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = ncol(cbn))
+  tab <- rbind(tab, x) 
+}
+```
+
+## ITS
+```{r}
+# Full Model ---------------------------------------------------------
+df_ITS <- data.frame(sample_data(data_ITS))
+dist_ITS <- phyloseq::distance(data_ITS, "bray")
+set.seed(012290)
+ad <- adonis(dist_ITS ~ Description*Genotype*SampleTime, data = df_ITS, permutations = 999) 
+ad <- adonis(dist_ITS ~ Description*HostSpecies*SampleTime, data = df_ITS, permutations = 999)
+
+# Break subset by plant niche -------------------------------------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+
+for(i in levels(as.factor(data_ITS@sam_data$Description))){
+  sub <- subset_samples(data_ITS, Description %in% i)
+  samp <- data.frame(sub@sam_data)
+  dist <- phyloseq::distance(sub, "bray")
+  set.seed(012290)
+  ad <- adonis(dist ~ SampleTime*Genotype, data = samp, permutations = 9999)
+  x$name <- i
+  x$`p-val.time` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 4)
+  x$`p-val.host` <- p.adjust(ad$aov.tab[2,6], method = "fdr", n = 4)
+  x$`p-val.interaction` <- p.adjust(ad$aov.tab[3,6], method = "fdr", n = 4)
+  x$`R^2.time` <- ad$aov.tab[1,5]
+  x$`R^2.host` <- ad$aov.tab[2,5]
+  x$`R^2.interaction` <- ad$aov.tab[3,5]
+  tab <- rbind(tab, x)
+}
+
+# Look at Leaf Endosphere interaction (never genotype effect) ---------------
+tab <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(tab) <- c("name", "R^2", "p-val")
+x <- data.frame(matrix(ncol = 3))
+colnames(x) <- c("name", "R^2", "p-val")
+data_ITS_LE <- subset_samples(data_ITS, Description == "Leaf Endosphere")
+for(i in levels(as.factor(data_ITS_LE@sam_data$SampleTime))){
+  sub <- subset_samples(data_ITS_LE, SampleTime %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ Genotype, data = samp, permutations = 999) 
+  x$name <- i 
+  x$`p-val` <- p.adjust(ad$aov.tab[1,6], method = "none", n = 3)
+  x$`R^2` <- ad$aov.tab[1,5]
+  tab <- rbind(tab, x) 
+}
+
+# Look at Leaf Endosphere interaction  ---------
+tab <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(tab) <- c("name", "R^2", "p-val")
+x <- data.frame(matrix(ncol = 3))
+colnames(x) <- c("name", "R^2", "p-val")
+data_ITS_LE <- subset_samples(data_ITS, Description == "Leaf Endosphere"& !(Genotype %in% c("Besc 22", "Besc 261")))
+for(i in levels(as.factor(data_ITS_LE@sam_data$Genotype))){
+  sub <- subset_samples(data_ITS_LE, Genotype %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ SampleTime, data = samp, permutations = 999) 
+  x$name <- i 
+  x$`p-val` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 8)
+  x$`R^2` <- ad$aov.tab[1,5]
+  tab <- rbind(tab, x) 
+  print(i)
+}
+
+# Look at Leaf Surface interaction -----------
+tab <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(tab) <- c("name", "R^2", "p-val")
+x <- data.frame(matrix(ncol = 3))
+colnames(x) <- c("name", "R^2", "p-val")
+data_ITS_LS <- subset_samples(data_ITS, Description == "Leaf Surface")
+for(i in levels(as.factor(data_ITS_LS@sam_data$SampleTime))){
+  sub <- subset_samples(data_ITS_LS, SampleTime %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ Genotype, data = samp, permutations = 999) 
+  x$name <- i 
+  x$`p-val` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 3)
+  x$`R^2` <- ad$aov.tab[1,5]
+  tab <- rbind(tab, x) 
+}
+
+# Look at multiple comparisons among genotypes --------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("niche", "comp1", "comp2", "R^2", "p-val", "p-val.adj")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("niche", "comp1", "comp2", "R^2", "p-val", "p-val.adj")
+for(j in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% j) 
+  cbn <- combn(x = levels(as.factor(sub@sam_data$Genotype)), m = 2)
+
+  for(i in 1:ncol(cbn)){
+   subs <- subset_samples(sub, Genotype %in% cbn[,i])
+   samp <- data.frame(sample_data(subs))
+   dist <- phyloseq::distance(subs, "bray")
+   set.seed(12290)
+   ad <- adonis(dist ~ Genotype, data = samp, permutations = 9999) 
+   x$name <- j
+   x$comp1 <- cbn[1,i]
+   x$comp2 <- cbn[2,i]
+   x$`R^2` <- ad$aov.tab[1,5]
+   x$`p-val` <- ad$aov.tab[1,6]
+   x$`p-val.adj` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = ncol(cbn))
+   tab <- rbind(tab, x) 
+   print(j)
+  }
+}
+
+# Gentype differences by host species---------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+for(i in levels(as.factor(data_ITS@sam_data$Description))){
+  sub <- subset_samples(data_ITS, Description %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ SampleTime*HostSpecies, data = samp, permutations = 999) 
+  x$name <- i 
+  x$`p-val.time` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 4)
+  x$`p-val.host` <- p.adjust(ad$aov.tab[2,6], method = "fdr", n = 4)
+  x$`p-val.interaction` <- p.adjust(ad$aov.tab[3,6], method = "fdr", n = 4)
+  x$`R^2.time` <- ad$aov.tab[1,5]
+  x$`R^2.host` <- ad$aov.tab[2,5]
+  x$`R^2.interaction` <- ad$aov.tab[3,5]
+  tab <- rbind(tab, x) 
+}
+
+# Gentype differences by septoria resistance ------------------------------------
+tab <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(tab) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+x <- data.frame(matrix(ncol = 7))
+colnames(x) <- c("name", "R^2.time", "p-val.time", "R^2.host", "p-val.host", "R^2.interaction", "p-val.interaction")
+for(i in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% i) 
+  samp <- data.frame(sub@sam_data) 
+  dist <- phyloseq::distance(sub, "bray") 
+  set.seed(12290)
+  ad <- adonis(dist ~ SampleTime*Resistance, data = samp, permutations = 999) 
+  x$name <- i 
+  x$`p-val.time` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = 4)
+  x$`p-val.host` <- p.adjust(ad$aov.tab[2,6], method = "fdr", n = 4)
+  x$`p-val.interaction` <- p.adjust(ad$aov.tab[3,6], method = "fdr", n = 4)
+  x$`R^2.time` <- ad$aov.tab[1,5]
+  x$`R^2.host` <- ad$aov.tab[2,5]
+  x$`R^2.interaction` <- ad$aov.tab[3,5]
+  tab <- rbind(tab, x) 
+}
+
+# Gentype differences by host species and septoria resistance for Spet. Leaf endosphere ---------------
+data_ITS_LE_Sept <- subset_samples(data_ITS, Description == "Leaf Endosphere" & SampleTime %in% c("June", "Sept."))
+samp <- data.frame(data_ITS_LE_Sept@sam_data) 
+dist <- phyloseq::distance(data_ITS_LE_Sept, "bray") 
+set.seed(12290)
+ad <- adonis(dist ~ HostSpecies, data = samp, permutations = 999) 
+ad <- adonis(dist ~ Resistance, data = samp, permutations = 999) 
+
+# Genotype multiple comparisons for Sept. Leaf Endosphere -----------------
+tab <- data.frame(matrix(ncol = 5, nrow = 0))
+colnames(tab) <- c("comp1", "comp2", "R^2", "p-val", "p-val.adj")
+x <- data.frame(matrix(ncol = 5))
+colnames(x) <- c("comp1", "comp2", "R^2", "p-val", "p-val.adj")
+cbn <- combn(x = levels(as.factor(data_ITS_LE_Sept@sam_data$Genotype)), m = 2)
+for(i in 1:ncol(cbn)){
+  subs <- subset_samples(data_ITS_LE_Sept, Genotype %in% cbn[,i])
+  samp <- data.frame(sample_data(subs))
+  dist <- phyloseq::distance(subs, "bray")
+  set.seed(12290)
+  ad <- adonis(dist ~ Genotype, data = samp, permutations = 9999) 
+  x$comp1 <- cbn[1,i]
+  x$comp2 <- cbn[2,i]
+  x$`R^2` <- ad$aov.tab[1,5]
+  x$`p-val` <- ad$aov.tab[1,6]
+  x$`p-val.adj` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = ncol(cbn))
+  tab <- rbind(tab, x) 
+}
+
+# Gentype differences by host species and septoria resistance for Spet. Leaf endosphere---------------
+data_ITS_LS_Sept <- subset_samples(data_ITS, Description == "Leaf Surface" & SampleTime %in% c("June", "Sept."))
+samp <- data.frame(data_ITS_LS_Sept@sam_data) 
+dist <- phyloseq::distance(data_ITS_LS_Sept, "bray") 
+set.seed(12290)
+ad <- adonis(dist ~ HostSpecies, data = samp, permutations = 999) 
+ad <- adonis(dist ~ Resistance, data = samp, permutations = 999) 
+
+# Genotype multiple comparisons for Sept. Leaf Endosphere  ------------------------
+tab <- data.frame(matrix(ncol = 5, nrow = 0))
+colnames(tab) <- c("comp1", "comp2", "R^2", "p-val", "p-val.adj")
+x <- data.frame(matrix(ncol = 5))
+colnames(x) <- c("comp1", "comp2", "R^2", "p-val", "p-val.adj")
+cbn <- combn(x = levels(as.factor(data_ITS_LS_Sept@sam_data$Genotype)), m = 2)
+for(i in 1:ncol(cbn)){
+  subs <- subset_samples(data_ITS_LS_Sept, Genotype %in% cbn[,i])
+  samp <- data.frame(sample_data(subs))
+  dist <- phyloseq::distance(subs, "bray")
+  set.seed(12290)
+  ad <- adonis(dist ~ Genotype, data = samp, permutations = 9999) 
+  x$comp1 <- cbn[1,i]
+  x$comp2 <- cbn[2,i]
+  x$`R^2` <- ad$aov.tab[1,5]
+  x$`p-val` <- ad$aov.tab[1,6]
+  x$`p-val.adj` <- p.adjust(ad$aov.tab[1,6], method = "fdr", n = ncol(cbn))
+  tab <- rbind(tab, x) 
+}
+```
+
+# Ordinations (Figure 2)
+```{r}
+# 16S ---------------------------------------------------
+myplots <- list()
+for(i in levels(as.factor(data_16S@sam_data$Description))){
+  sub <- subset_samples(data_16S, Description %in% i)
+  set.seed(01221990)
+  ordu <- ordinate(sub, "PCoA", "bray", weighted = T)
+  p <- plot_ordination(sub, ordu)
+  p2 <- ggplot(p$data, p$mapping) +
+    geom_point(aes(shape = HostSpecies, fill = SampleTime), size = 2, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24),
+                       labels = c(expression(italic("P. deltoides")), 
+                                  expression(italic("P. trichocarpa")))) +
+    ggtitle(i) +
+    scale_x_continuous(name = paste0(paste0("PCoA 1 (", round(100*as.data.frame(ordu$values)[1,2], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("PCoA 2 (", round(100*as.data.frame(ordu$values)[2,2], 1)), "%)")) +
+    guides(fill = guide_legend(override.aes = list(pch = 21, size = 4))) 
+  myplots[[i]] <- p2 + theme(legend.position = "none")
+  print(i)
+  print(ordu$stress)
+}
+
+grid_16S <- plot_grid(plotlist = myplots, align = "vh")
+
+# ITS -------------------------------------------------------
+myplots_ITS <- list()
+for(i in levels(as.factor(data_ITS@sam_data$Description))){
+  sub <- subset_samples(data_ITS, Description %in% i)
+  ordu <- ordinate(sub, "PCoA", "bray", weighted = T)
+  p <- plot_ordination(sub, ordu)
+  p2 <- ggplot(p$data, p$mapping) +
+    geom_point(aes(shape = HostSpecies, fill = SampleTime), size = 2, alpha = 0.5) +
+    scale_shape_manual(values = c(21,24),
+                       labels = c(expression(italic("P. deltoides")), 
+                                  expression(italic("P. trichocarpa")))) +
+    ggtitle(i) +
+    theme(legend.text = element_text(hjust = 0)) +
+    scale_x_continuous(name = paste0(paste0("PCoA 1 (", round(100*as.data.frame(ordu$values)[1,2], 1)), "%)")) +
+    scale_y_continuous(name = paste0(paste0("PCoA 2 (", round(100*as.data.frame(ordu$values)[2,2], 1)), "%)")) +
+    guides(fill = guide_legend(override.aes = list(pch = 21))) 
+  myplots_ITS[[i]] <- p2 + theme(legend.position = "none")
+  print(i)
+  print(ordu$stress)
+}
+
+grid_ITS <- plot_grid(plotlist = myplots_ITS, align = "vh")
+
+# Figure 2 ---------------------------------------------
+leg <- get_legend(p2 + theme(legend.position = "right"))
+pgrid <- plot_grid(grid_16S, grid_ITS, labels = "AUTO", align = "vh", ncol = 1)
+beta_all <- plot_grid(pgrid, leg, ncol = 2, rel_widths = c(1, 0.3))
+
+eps("Fig_2.eps", res = 300, height = 7.8, width = 6.5, units = "in")
+beta_all
+dev.off()
+```
+
+# Taxonomy (Figures S4-S6)
+```{r}
+# 16S ----------------------------------------------------------------
+## Major Taxa -------------------------------------------------------
+#Seperate Proteos, assign grouping by Class, glom, and melt
+proteos <- subset_taxa(data_16S, Class == "c__Alphaproteobacteria" |
+                                     Class == "c__Betaproteobacteria" |
+                                     Class == "c__Deltaproteobacteria" |
+                                     Class == "c__Gammaproteobacteria")
+colnames(tax_table(proteos))[1] <- "group"
+tax_table(proteos)[,"group"] <- tax_table(proteos)[,"Class"]
+proteos_glom <- tax_glom(proteos, taxrank = "group")
+proteos_melt <- psmelt(proteos_glom)
+
+#Do same for Archaea
+
+archaea <- subset_taxa(data_16S, Domain == "k__Archaea")
+colnames(tax_table(archaea))[1] <- "group"
+archaea_glom <- tax_glom(archaea, taxrank = "group")
+archaea_melt <- psmelt(archaea_glom)
+
+#Get the rest of the abundant phyla, assign grouping by phylum, glom, and melt
+abundant_non_proteos <- subset_taxa(data_16S, Phylum == "p__Verrucomicrobia" |
+                                              Phylum == "p__TM7"|
+                                              Phylum == "p__Planctomycetes"|
+                                              Phylum == "p__Firmicutes" |
+                                              Phylum == "p__Gemmatimonadetes" |
+                                              Phylum == "p__Chloroflexi" |
+                                              Phylum == "p__Bacteroidetes" |
+                                              Phylum == "p__Acidobacteria" |
+                                              Phylum == "p__Actinobacteria")
+colnames(tax_table(abundant_non_proteos))[1] <- "group"
+tax_table(abundant_non_proteos)[,"group"] <- tax_table(abundant_non_proteos)[,"Phylum"]
+abundant_non_proteos_glom <- tax_glom(abundant_non_proteos, taxrank = "group")
+abundant_non_proteos_melt <- psmelt(abundant_non_proteos_glom)
+
+#concatenate the datasets
+data_16S_grouping <- rbind(proteos_melt, abundant_non_proteos_melt, archaea_melt)
+
+sum2 <- data_16S_grouping %>% 
+  group_by(SampleTime, Description, group, HostSpecies) %>%
+  dplyr::summarise(means = mean(Abundance))
+
+sum2$group <- sapply(strsplit(as.character(sum2$group), "__"), `[`, 2)
+
+rare <- sum2 %>%
+  group_by(SampleTime, Description, HostSpecies) %>%
+  dplyr::summarise(means = 1- sum(means)) %>%
+  mutate(group = "Rare Taxa")
+
+sum2 = rbind(sum2, rare)
+
+sum2$group <- ordered(sum2$group, c("Archaea", "Alphaproteobacteria", "Betaproteobacteria",
+                                    "Deltaproteobacteria", "Gammaproteobacteria", "Acidobacteria",
+                                    "Actinobacteria", "Bacteroidetes", "Chloroflexi", "Firmicutes",
+                                    "Gemmatimonadetes", "Planctomycetes", "TM7", "Verrucomicrobia",
+                                    "Rare Taxa"))
+
+rel_plots_16S2 <- list()
+for(i in levels(as.factor(sum2$Description))){
+  sub <- subset(sum2, Description %in% i)
+  p2 <- ggplot(sub, aes(x = SampleTime, y = means, fill = group)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~HostSpecies, 
+               labeller = labeller(HostSpecies = c("deltoides" = "P. deltoides",
+                                                   "trichocarpa" = "P. trichocarpa"))) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#5ca7db", "#abd2ed", "yellow",
+                                 "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", 
+                                 "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(face = "italic", size = 11),
+          axis.title = element_blank(), axis.text.x = element_text(size = 9), plot.title = element_text(hjust = 0.5)) 
+  rel_plots_16S2[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2, align = "vh")
+rel_16S_phyla <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+## Order level ---------------------------------------
+order_sum_16S <- tapply(taxa_sums(data_16S), 
+                         tax_table(data_16S)[, "Order"], sum, na.rm=TRUE)
+top10order_16S <- names(sort(order_sum_16S, TRUE))[1:10]
+
+abundant_16S_order <- subset_taxa(data_16S, Order %in% top10order_16S)
+abundant_16S_order_glom <- tax_glom(abundant_16S_order, taxrank = "Order")
+abundant_16S_order_melt <- psmelt(abundant_16S_order_glom)
+
+sum2 <- abundant_16S_order_melt %>% 
+  group_by(SampleTime, Description, HostSpecies, Order) %>%
+  dplyr::summarise(means = mean(Abundance))
+
+#Fix names
+sum2$Order <- sapply(strsplit(as.character(sum2$Order), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(SampleTime, Description, HostSpecies) %>%
+  dplyr::summarise(means = 1- sum(means)) %>%
+  mutate(Order = "Other/Unidentified Order")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+#order groups
+sum2$Order <- recode(sum2$Order, `[Saprospirales]` = "Saprospirales")
+sum2$Order <- forcats::fct_relevel(sum2$Order, "Other/Unidentified Order", after = Inf)
+
+rel_plots_16S2_order <- list()
+for(i in levels(as.factor(sum2$Description))){
+  sub <- subset(sum2, Description %in% i)
+  p2 <- ggplot(sub, aes(x = SampleTime, y = means, fill = Order)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~HostSpecies, 
+               labeller = labeller(HostSpecies = c("deltoides" = "P. deltoides",
+                                                   "trichocarpa" = "P. trichocarpa"))) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(face = "italic", size = 11),
+          axis.title = element_blank(), axis.text.x = element_text(size = 9), plot.title = element_text(hjust = 0.5)) 
+  rel_plots_16S2_order[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2_order, align = "vh")
+rel_16S_order <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+# Genus level -----------------------------------
+genus_sum_16S <- tapply(taxa_sums(data_16S), 
+                         tax_table(data_16S)[, "Genus"], sum, na.rm=TRUE)
+top10genus_16S <- names(sort(genus_sum_16S, TRUE))[1:10]
+
+abundant_16S_genus <- subset_taxa(data_16S, Genus %in% top10genus_16S)
+abundant_16S_genus_glom <- tax_glom(abundant_16S_genus, taxrank = "Genus")
+abundant_16S_genus_melt <- psmelt(abundant_16S_genus_glom)
+
+sum2 <- abundant_16S_genus_melt %>% 
+  group_by(SampleTime, Description, HostSpecies, Genus) %>%
+  dplyr::summarise(means = mean(Abundance))
+
+sum2$Genus <- sapply(strsplit(as.character(sum2$Genus), "__"), `[`, 2)
+
+rare <- sum2 %>%
+  group_by(SampleTime, Description, HostSpecies) %>%
+  dplyr::summarise(means = 1- sum(means)) %>%
+  mutate(Genus = "Other/Unidentified Genus")
+
+sum2 <- rbind(sum2, rare)
+
+sum2$Genus <- forcats::fct_relevel(sum2$Genus, "Other/Unidentified Genus", after = Inf)
+
+rel_plots_16S2_genus <- list()
+for(i in levels(as.factor(sum2$Description))){
+  sub <- subset(sum2, Description %in% i)
+  p2 <- ggplot(sub, aes(x = SampleTime, y = means, fill = Genus)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~HostSpecies, 
+               labeller = labeller(HostSpecies = c("deltoides" = "P. deltoides",
+                                                   "trichocarpa" = "P. trichocarpa"))) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(face = "italic", size = 11),
+          axis.title = element_blank(), axis.text.x = element_text(size = 9), plot.title = element_text(hjust = 0.5)) 
+  rel_plots_16S2_genus[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_16S2 <- plot_grid(plotlist = rel_plots_16S2_genus, align = "vh")
+rel_16S_genus <- plot_grid(grid_rel_plots_16S2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+# ITS ----------------------------------------------------------------
+## Phylum level -----------------------------------------------------
+#Get the rest of the abundant phyla, assign grouping by phylum, glom, and melt
+abundant_ITS <- subset_taxa(data_ITS, Phylum == "p__Ascomycota" |
+                                      Phylum == "p__Basidiomycota"|
+                                      Phylum == "p__Chytridiomycota"|
+                                      Phylum == "p__Mortierellomycota"|
+                                      Phylum == "p__Mucoromycota" |
+                                      Phylum == "p__Olpidiomycota" |
+                                      Phylum == "p__unidentified")
+colnames(tax_table(abundant_ITS))[1] <- "group"
+tax_table(abundant_ITS)[,"group"] <- tax_table(abundant_ITS)[,"Phylum"]
+abundant_ITS_glom <- tax_glom(abundant_ITS, taxrank = "group")
+abundant_ITS_melt <- psmelt(abundant_ITS_glom)
+
+#summarise averages of time x niche x group x species combos
+
+sum2 <- abundant_ITS_melt %>% 
+  group_by(SampleTime, Description, group, HostSpecies) %>%
+  dplyr::summarise(means = mean(Abundance))
+
+#Fix names
+sum2$group <- sapply(strsplit(as.character(sum2$group), "__"), `[`, 2)
+
+#Everything that's left is considered rare  
+rare <- sum2 %>%
+  group_by(SampleTime, Description, HostSpecies) %>%
+  dplyr::summarise(means = 1- sum(means)) %>%
+  mutate(group = "Rare Taxa")
+
+#concatenate the datasets
+sum2 = rbind(sum2, rare)
+
+sum2$group<- recode(sum2$group, unidentified = "Unidentified")
+
+#order groups
+sum2$group <- ordered(sum2$group, c("Ascomycota", "Basidiomycota", "Chytridiomycota",
+                                    "Mortierellomycota", "Mucoromycota", "Olpidiomycota", 
+                                    "Unidentified", "Rare Taxa"))
+
+rel_plots_ITS2 <- list()
+for(i in levels(as.factor(sum2$Description))){
+  sub <- subset(sum2, Description %in% i)
+  p2 <- ggplot(sub, aes(x = SampleTime, y = means, fill = group)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~HostSpecies, 
+               labeller = labeller(HostSpecies = c("deltoides" = "P. deltoides",
+                                                   "trichocarpa" = "P. trichocarpa"))) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e","#1f77b4", "yellow", "#17becf",
+                               "#2ca02c", "#d62728", "gray", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(size = 11, face = "italic"), axis.text.x = element_text(size = 9),
+          axis.title = element_blank(), plot.title = element_text(hjust = 0.5))
+  rel_plots_ITS2[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2, align = "vh")
+rel_ITS_phyla <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+## Order level ---------------------------------------
+order_sum_ITS <- tapply(taxa_sums(data_ITS), 
+                         tax_table(data_ITS)[, "Order"], sum, na.rm=TRUE)
+top10order_ITS <- names(sort(order_sum_ITS, TRUE))[1:10]
+
+abundant_ITS_order <- subset_taxa(data_ITS, Order %in% top10order_ITS)
+abundant_ITS_order_glom <- tax_glom(abundant_ITS_order, taxrank = "Order")
+abundant_ITS_order_melt <- psmelt(abundant_ITS_order_glom)
+
+sum2 <- abundant_ITS_order_melt %>% 
+  group_by(SampleTime, Description, HostSpecies, Order) %>%
+  dplyr::summarise(means = mean(Abundance))
+
+sum2$Order <- sapply(strsplit(as.character(sum2$Order), "__"), `[`, 2)
+
+rare <- sum2 %>%
+  group_by(SampleTime, Description, HostSpecies) %>%
+  dplyr::summarise(means = 1- sum(means)) %>%
+  mutate(Order = "Other/Unidentified Order")
+
+sum2 = rbind(sum2, rare)
+
+sum2$Order <- recode(sum2$Order, `[Saprospirales]` = "Saprospirales")
+sum2$Order <- forcats::fct_relevel(sum2$Order, "Other/Unidentified Order", after = Inf)
+
+rel_plots_ITS2_order <- list()
+for(i in levels(as.factor(sum2$Description))){
+  sub <- subset(sum2, Description %in% i)
+  p2 <- ggplot(sub, aes(x = SampleTime, y = means, fill = Order)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~HostSpecies, 
+               labeller = labeller(HostSpecies = c("deltoides" = "P. deltoides",
+                                                   "trichocarpa" = "P. trichocarpa"))) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#e377c2", 
+                                 "#7f7f7f", "#17becf", "white")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(face = "italic", size = 11),
+          axis.title = element_blank(), axis.text.x = element_text(size = 9), plot.title = element_text(hjust = 0.5)) 
+  rel_plots_ITS2_order[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2_order, align = "vh")
+rel_ITS_order <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+## Genus level -----------------------------------
+genus_sum_ITS <- tapply(taxa_sums(data_ITS), 
+                         tax_table(data_ITS)[, "Genus"], sum, na.rm=TRUE)
+top10genus_ITS <- names(sort(genus_sum_ITS, TRUE))[1:10]
+
+abundant_ITS_genus <- subset_taxa(data_ITS, Genus %in% top10genus_ITS)
+abundant_ITS_genus_glom <- tax_glom(abundant_ITS_genus, taxrank = "Genus")
+abundant_ITS_genus_melt <- psmelt(abundant_ITS_genus_glom)
+
+sum2 <- abundant_ITS_genus_melt %>% 
+  filter(Genus != "g__unidentified") %>%
+  group_by(SampleTime, Description, HostSpecies, Genus) %>%
+  dplyr::summarise(means = mean(Abundance))
+
+sum2$Genus <- sapply(strsplit(as.character(sum2$Genus), "__"), `[`, 2)
+
+rare <- sum2 %>%
+  group_by(SampleTime, Description, HostSpecies) %>%
+  dplyr::summarise(means = 1- sum(means)) %>%
+  mutate(Genus = "Other/Unidentified Genus")
+
+sum2 = rbind(sum2, rare)
+
+sum2$Genus <- forcats::fct_relevel(sum2$Genus, "Other/Unidentified Genus", after = Inf)
+
+rel_plots_ITS2_genus <- list()
+for(i in levels(as.factor(sum2$Description))){
+  sub <- subset(sum2, Description %in% i)
+  p2 <- ggplot(sub, aes(x = SampleTime, y = means, fill = Genus)) +
+    geom_bar(position = "stack", stat = "identity", col = "black") +
+    facet_wrap(~HostSpecies, 
+               labeller = labeller(HostSpecies = c("deltoides" = "P. deltoides",
+                                                   "trichocarpa" = "P. trichocarpa"))) +
+    theme(legend.position = "right", legend.title = element_blank(), axis.line = element_blank()) +
+    scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#abd2ed", "yellow",
+                                 "#8c564b", "#d62728", "#9467bd", "#2ca02c", "#7f7f7f")) +
+    scale_y_continuous(name = NULL, breaks = NULL) +
+    panel_border() +
+    ggtitle(i) +
+    theme(strip.text = element_text(face = "italic", size = 11),
+          axis.title = element_blank(), axis.text.x = element_text(size = 9), plot.title = element_text(hjust = 0.5)) 
+  rel_plots_ITS2_genus[[i]] <- p2 + theme(legend.position = "none")
+}
+
+leg <- get_legend(p2 + theme(legend.position = "right"))
+grid_rel_plots_ITS2 <- plot_grid(plotlist = rel_plots_ITS2_genus, align = "vh")
+rel_ITS_genus <- plot_grid(grid_rel_plots_ITS2, leg, ncol = 2, rel_widths = c(1, 0.4))
+
+prow_phyla <- plot_grid(rel_16S_phyla, rel_ITS_phyla, ncol = 1, labels = c("A)", "B)"))
+prow_order <- plot_grid(rel_16S_order, rel_ITS_order, ncol = 1, labels = c("A)", "B)"))
+prow_genus <- plot_grid(rel_16S_genus, rel_ITS_genus, ncol = 1, labels = c("A)", "B)"))
+
+# Export plots ------------------------------------
+eps("Fig_S4.eps", res = 300, height = 7.5, width = 6.5, units = "in")
+prow_phyla
+dev.off()
+
+eps("Fig_S5.eps", res = 300, height = 7.5, width = 6.5, units = "in")
+prow_order
+dev.off()
+
+eps("Fig_S6.eps", res = 300, height = 7.5, width = 6.5, units = "in")
+prow_genus
+dev.off()
+```
+
+# Fungal Guilds
+```{r}
+# Set up ------------------------------------------------
+fg <- parse_funguild()
+data_ITS_tax <- as.data.frame(as(tax_table(data_ITS), "matrix"))
+data_ITS_tax$Genus <- sapply(strsplit(as.character(data_ITS_tax$Genus), "__"), `[`, 2)
+data_ITS_tax$OTU <- rownames(data_ITS_tax)
+data_ITS_tax_fg <- merge(data_ITS_tax, 
+                         fg %>% filter(taxonomicLevel == "Genus"), 
+                         by.x = "Genus", by.y = "taxon", all.x = T)
+data_ITS_tax_fg$guild[str_detect(data_ITS_tax_fg$guild, "Ectomycorrhizal") == TRUE] <- "Ectomycorrhizal"
+data_ITS_tax_fg$guild[data_ITS_tax_fg$Family == "f__Glomeraceae"] <- "Arbuscular Mycorrhizal"
+data_ITS_tax_fg$guild[str_detect(data_ITS_tax_fg$guild, "athogen") == TRUE] <- "Pathogen"
+
+TAX <- tax_table(data_ITS_tax_fg)
+
+taxa_names(TAX) <- data_ITS_tax_fg$OTU
+data_ITS_fg <- merge_phyloseq(otu_table(data_ITS), TAX, data_ITS@sam_data)
+data_ITS_fg <- transform_sample_counts(data_ITS_fg, function(x) x/sum(x))
+
+data_ITS_EM   <- subset_taxa(data_ITS_fg, ta11 == "Ectomycorrhizal")
+data_ITS_AM   <- subset_taxa(data_ITS_fg, ta11 == "Arbuscular Mycorrhizal")
+data_ITS_PATH <- subset_taxa(data_ITS_fg, ta11 == "Pathogen")
+data_ITS_PATH <- subset_taxa(data_ITS_PATH, !(ta1 %in% c("Acaromyces", "Acremonium", "Arthroderma", "Ascophaera", "Aspergillus", "Athelia", 
+                                                       "Basidiobolus", "Beauveria",
+                                                       "Candida", "Chaetomium", "Coniosporium", 
+                                                       "Cutaneotrichosporon", "Cyphellophora", "Cryptococcus",
+                                                       "Exophiala",
+                                                       "Lecanicillium",
+                                                       "Malassezia", "Metarhizium", "Microascus", "Mycena",
+                                                       "Pandora", "Pseudogymnoascus", "Rhodotorula", "Tolypocladium")))
+
+# EM -------------------------------------------
+EM_melt <- psmelt(data_ITS_EM)
+EM_melt %>%
+  group_by(Description, SampleTime, HostSpecies, Genotype, Resistance, Replicate) %>%
+  dplyr::summarise(sum = sum(Abundance)*100) -> EM_sum
+
+## Root endosphere ------------------------
+kruskal.test(sum ~ SampleTime, data = EM_sum %>% filter(Description == "Root Endosphere"))
+dunnTest(sum ~ SampleTime, data = EM_sum %>% filter(Description == "Root Endosphere"))
+
+
+## Rhizosphere ----------------------------
+kruskal.test(sum ~ SampleTime, data = EM_sum %>% filter(Description == "Rhizosphere"))
+dunnTest(sum ~ SampleTime, data = EM_sum %>% filter(Description == "Rhizosphere"))
+
+EM_sum %>% 
+  filter(Description == "Rhizosphere" | Description == "Root Endosphere") %>%
+  group_by(Description, SampleTime) %>%
+  dplyr::summarise(mean = mean(sum), se = sd(sum)/sqrt(n())) %>%
+  mutate(Guild = "EM")-> EM_sum_ave
+
+# AMF ---------------------------------------------------------
+AM_melt <- psmelt(data_ITS_AM)
+AM_melt %>%
+  group_by(Description, SampleTime, Genotype, Replicate) %>%
+  dplyr::summarise(sum = sum(Abundance)*100) -> AM_sum
+
+## Root endosphere ------------------------
+kruskal.test(sum ~ SampleTime, data = AM_sum %>% filter(Description == "Root Endosphere"))
+dunnTest(sum ~ SampleTime, data = AM_sum %>% filter(Description == "Root Endosphere"))
+
+## Rhizosphere ----------------------------
+kruskal.test(sum ~ SampleTime, data = AM_sum %>% filter(Description == "Rhizosphere"))
+dunnTest(sum ~ SampleTime, data = AM_sum %>% filter(Description == "Rhizosphere"))
+
+AM_sum %>% 
+  filter(Description == "Rhizosphere" | Description == "Root Endosphere") %>%
+  group_by(Description, SampleTime) %>%
+  dplyr::summarise(mean = mean(sum), se = sd(sum)/sqrt(n())) %>%
+  mutate(Guild = "AM") -> AM_sum_ave
+
+# Pathogens -------------------------------------------------
+PATH_melt <- psmelt(data_ITS_PATH)
+PATH_melt %>%
+  group_by(Description, SampleTime, Genotype, Resistance, HostSpecies, Replicate) %>%
+  dplyr::summarise(sum = sum(Abundance)*100) -> PATH_sum
+
+for(i in levels(as.factor(PATH_sum$Description))){
+  x <- kruskal.test(sum ~ SampleTime, data = PATH_sum %>% filter(Description %in% i))
+  y <- dunnTest(sum ~ SampleTime, data = PATH_sum %>% filter(Description %in% i))
+  print(i)
+  print(x$p.value)
+  print(as.matrix(y$res))
+} 
+
+PATH_sum %>% 
+  group_by(Description, SampleTime) %>%
+  dplyr::summarise(mean = mean(sum), se = sd(sum)/sqrt(n())) %>%
+  mutate(Guild = "Pathogen")-> PATH_sum_ave
+
+# Plot -------------------------------------
+letters <- data.frame(Guild = c("AM", "AM", "AM", "EM", "EM", "EM", "Pathogen", "Pathogen", "Pathogen"),
+                      label = c("b", "a", "a", "b", "a", "a", "a", "b", "c"),
+                      x = c("T0", "June", "Sept.", "T0", "June", "Sept.", "T0", "June", "Sept."),
+                      y = c(0.03, 0.43, 0.21, 0.2, 3.0, 2.7, 77, 50, 25))
+rbind(PATH_sum_ave, AM_sum_ave, EM_sum_ave) %>%
+  filter(Description == "Root Endosphere") %>%
+  mutate(SampleTime = ordered(SampleTime, c("T0", "June", "Sept."))) %>%
+  ggplot(aes(x = SampleTime, y = mean, fill = SampleTime)) +
+  geom_bar(stat = "identity", col = "black") +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  geom_text(data = letters, aes(x = x, y = y, label = label), inherit.aes = F) +
+  facet_wrap(~Guild, scales = "free")  +
+  scale_y_continuous("Relative Abundance (%)") +
+  scale_x_discrete(name = NULL) +
+  theme(legend.position = "none") -> p_root
+
+letters <- data.frame(Guild = c("AM", "AM", "AM", "EM", "EM", "EM", "Pathogen", "Pathogen", "Pathogen"),
+                      label = c("b", "a", "a", "c", "b", "a", "a", "b", "c"),
+                      x = c("T0", "June", "Sept.", "T0", "June", "Sept.", "T0", "June", "Sept."),
+                      y = c(0.01, 0.15, 0.16, 0.045, 0.37, 0.7, 73, 48, 33))
+rbind(PATH_sum_ave, AM_sum_ave, EM_sum_ave) %>%
+  filter(Description == "Rhizosphere") %>%
+  mutate(SampleTime = ordered(SampleTime, c("T0", "June", "Sept."))) %>%
+  ggplot(aes(x = SampleTime, y = mean, fill = SampleTime)) +
+  geom_bar(stat = "identity", col = "black") +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  geom_text(data = letters, aes(x = x, y = y, label = label), inherit.aes = F) +
+  facet_wrap(~Guild, scales = "free") +
+  scale_y_continuous("Relative Abundance (%)") +
+  scale_x_discrete(name = NULL) +
+  theme(legend.position = "none") -> p_rhizo
+
+prow <- plot_grid(p_root, p_rhizo, labels = "AUTO", align = "vh", ncol = 1)
+
+esp("Fig_3.eps", res = 300, height = 4.5, width = 6.5, units = "in")
+prow
+dev.off()
+```
+
+# Core taxa
+```{r}
+# 16S ---------------------------------------------
+data_16S_glom_g <- tax_glom(data_16S, "Genus")
+data_16S_glom_g <- transform_sample_counts(data_16S_glom_g, function(x) x/sum(x))
+data_16S_glom_g_pa <- data_16S_glom_g
+data_16S_glom_g_pa@otu_table[data_16S_glom_g_pa@otu_table > 0] <- 1
+
+occupancy <- data.frame()
+for(i in levels(as.factor(data_16S_glom_g_pa@sam_data$Description))){
+  sub <- subset_samples(data_16S_glom_g_pa, Description %in% i)
+  description <- i
+  occ <- taxa_sums(sub) / dim(sub@sam_data)[1]
+  OTU <- row.names(as.matrix(occ))
+  x <- cbind(description, occ, OTU)
+  occupancy <- rbind(occupancy, x)
+}
+
+abundance <- data.frame()
+for(i in levels(as.factor(data_16S_glom_g@sam_data$Description))){
+  sub <- subset_samples(data_16S_glom_g, Description %in% i)
+  description <- i
+  abun <- taxa_sums(sub) / dim(sub@sam_data)[1]
+  OTU <- row.names(as.matrix(abun))
+  x <- cbind(description, time, abun, OTU)
+  abundance <- rbind(abundance, x)
+}
+
+Occ_Abun <- merge(occupancy, abundance, by = c("OTU", "description"))
+
+tax <- as(tax_table(data_16S_glom_g), "matrix")
+tax <- as.data.frame(tax)
+Occ_Abun <- merge(Occ_Abun, tax, by.x = "OTU", by.y = "row.names", all.x = T)
+
+#Fix names
+Occ_Abun$Group <- sapply(strsplit(as.character(Occ_Abun$Phylum ), "__"), `[`, 2)
+Occ_Abun$Group[Occ_Abun$Domain == "k__Archaea"] <- "Archaea"
+Occ_Abun$Group[Occ_Abun$Class  == "c__Alphaproteobacteria"] <- "Alphaproteobacteria"
+Occ_Abun$Group[Occ_Abun$Class  == "c__Betaproteobacteria"]  <- "Betaproteobacteria"
+Occ_Abun$Group[Occ_Abun$Class  == "c__Deltaproteobacteria"] <- "Deltaproteobacteria"
+Occ_Abun$Group[Occ_Abun$Class  == "c__Gammaproteobacteria"] <- "Gammaproteobacteria"
+Occ_Abun$Group[!(Occ_Abun$Group %in% Groups)] <- "Other"
+
+#order groups
+Occ_Abun$Group <- ordered(Occ_Abun$Group, c("Archaea", "Alphaproteobacteria", 
+                                            "Betaproteobacteria", "Deltaproteobacteria", 
+                                            "Gammaproteobacteria", "Acidobacteria",
+                                            "Actinobacteria", "Bacteroidetes", "Chloroflexi", 
+                                            "Firmicutes","Gemmatimonadetes", 
+                                            "Planctomycetes", "TM7", "Verrucomicrobia", "Other"))
+
+Occ_Abun %>% filter(abun > 0) %>%
+  mutate(description = ordered(description, c("Leaf Endosphere", "Leaf Surface", "Root Endosphere", "Rhizosphere"))) %>%
+  ggplot(aes(x = as.numeric(occ)*100, y = as.numeric(abun)*100, fill = Group)) +
+  geom_jitter(alpha = 0.66, size = 2, pch = 21) +
+  facet_wrap(~description) +
+  coord_cartesian(ylim = c(0, 5)) +
+  scale_fill_manual(values = c("#ff7f0e", "#0e334d","#1f77b4", "#5ca7db", "#abd2ed", "yellow",
+                               "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", 
+                               "#7f7f7f", "#bcbd22", "#17becf", "white")) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_vline(xintercept = 95, linetype = "dashed") +
+  scale_y_continuous(name = "Average Relative Abundance (%)") +
+  scale_x_continuous(name = "Occupancy (%)") +
+  guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+  panel_border()-> p_bac
+
+prow <- plot_grid(p_bac + coord_cartesian(ylim = c(0,22)), p_fung + coord_cartesian(ylim = c(0, 35)), 
+                  labels = "AUTO", ncol = 1, align = "vh", axis = "lr")
+
+eps("Fig_S8.eps", height = 7, width = 6.5, units = "in", res = 100)
+prow
+dev.off()
+
+CoreGenera <- Occ_Abun %>%
+  filter(abun > .01 & occ > 0.95)
+
+core_w_time_bac <- data.frame()
+for(i in levels(as.factor(CoreGenera$description))){
+  sub <- CoreGenera %>% filter(description %in% i)
+  x <- sub$Genus
+  data_16S_glom_g %>% 
+    subset_samples(Description %in% i) %>% 
+    subset_taxa(Genus %in% x) %>% 
+    psmelt() %>%
+    group_by(SampleTime, Sample) %>%
+    dplyr::summarise(sum = sum(Abundance)) -> y 
+    y$description <- i
+    core_w_time_bac <- rbind(core_w_time_bac, y)
+}
+
+for(i in levels(as.factor(CoreGenera$description))){
+  sub <- CoreGenera %>% filter(description %in% i)
+  x <- sub$Genus
+  data_16S_glom_g %>% 
+    subset_samples(Description %in% i) %>% 
+    subset_taxa(Genus %in% x) %>% 
+    psmelt() %>%
+    group_by(SampleTime, Sample) %>%
+    dplyr::summarise(sum = sum(Abundance)) -> y 
+    print(i)
+    y %>% group_by(SampleTime) %>% summarise(mean = mean(sum)) %>% print.data.frame()
+    print(summary(aov(sum ~ SampleTime, y)))
+}
+
+# ITS -------------------------------
+data_ITS_glom_g <- tax_glom(data_ITS, "Genus")
+data_ITS_glom_g <- transform_sample_counts(data_ITS_glom_g, function(x) x/sum(x))
+data_ITS_glom_g_pa <- data_ITS_glom_g
+data_ITS_glom_g_pa@otu_table[data_ITS_glom_g_pa@otu_table > 0] <- 1
+
+occupancy <- data.frame()
+for(i in levels(as.factor(data_ITS_glom_g_pa@sam_data$Description))){
+  sub <- subset_samples(data_ITS_glom_g_pa, Description %in% i)
+  description <- i
+  occ <- taxa_sums(sub) / dim(sub@sam_data)[1]
+  OTU <- row.names(as.matrix(occ))
+  x <- cbind(description, occ, OTU)
+  occupancy <- rbind(occupancy, x)
+}
+
+abundance <- data.frame()
+for(i in levels(as.factor(data_ITS_glom_g@sam_data$Description))){
+  sub <- subset_samples(data_ITS_glom_g, Description %in% i)
+  description <- i
+  abun <- taxa_sums(sub) / dim(sub@sam_data)[1]
+  OTU <- row.names(as.matrix(abun))
+  x <- cbind(description, abun, OTU)
+  abundance <- rbind(abundance, x)
+}
+
+Occ_Abun <- merge(occupancy, abundance, by = c("OTU", "description"))
+
+tax <- as(tax_table(data_ITS_glom_g), "matrix")
+tax <- as.data.frame(tax)
+Occ_Abun <- merge(Occ_Abun, tax, by.x = "OTU", by.y = "row.names", all.x = T)
+
+Occ_Abun$Phylum <- sapply(strsplit(as.character(Occ_Abun$Phylum ), "__"), `[`, 2)
+FungiPhyla <- c("Ascomycota", "Basidiomycota", "Chytridiomycota", "Mortierellomycota", "Mucoromycota", "Olpidiomycota", "Other")
+Occ_Abun$Phylum[!(Occ_Abun$Phylum %in% FungiPhyla)] <- "Other"
+Occ_Abun$Phylum <- ordered(Occ_Abun$Phylum, c("Ascomycota", "Basidiomycota", "Chytridiomycota",
+                                              "Mortierellomycota", "Mucoromycota", "Olpidiomycota", 
+                                              "Other"))
+
+Occ_Abun %>% filter(abun > 0) %>%
+  mutate(description = ordered(description, c("Leaf Endosphere", "Leaf Surface", "Root Endosphere", "Rhizosphere"))) %>%
+  ggplot(aes(x = as.numeric(occ)*100, y = as.numeric(abun)*100, fill = Phylum)) +
+  geom_jitter(alpha = 0.66, size = 2, pch = 21) +
+  facet_wrap(~description) +
+  coord_cartesian(ylim = c(0, 26)) +
+  scale_fill_manual(values = c("#ff7f0e","#1f77b4", "yellow", "#17becf",
+                               "#2ca02c", "#d62728", "grey")) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_vline(xintercept = 95, linetype = "dashed") +
+  scale_y_continuous(name = "Average Relative Abundance (%)") +
+  scale_x_continuous(name = "Occupancy (%)") +
+  theme(legend.title = element_blank()) -> p_fung
+
+CoreGenera_Fungi <- Occ_Abun %>%
+  filter(abun > .01 & occ > 0.95)
+
+core_w_time_fung <- data.frame()
+for(i in levels(as.factor(CoreGenera_Fungi$description))){
+  sub <- CoreGenera_Fungi %>% filter(description %in% i)
+  x <- sub$Genus
+  data_ITS_glom_g %>% 
+    subset_samples(Description %in% i) %>% 
+    subset_taxa(Genus %in% x) %>% 
+    psmelt() %>%
+    group_by(SampleTime, Sample) %>%
+    dplyr::summarise(sum = sum(Abundance)) -> y
+    y$description <- i
+    y$SampleTime <- as.character(y$SampleTime)
+    core_w_time_fung <- rbind(core_w_time_fung, y)
+}
+
+for(i in levels(as.factor(CoreGenera_Fungi$description))){
+  sub <- CoreGenera_Fungi %>% filter(description %in% i)
+  x <- sub$Genus
+  data_ITS_glom_g %>% 
+    subset_samples(Description %in% i) %>% 
+    subset_taxa(Genus %in% x) %>% 
+    psmelt() %>%
+    group_by(SampleTime, Sample) %>%
+    dplyr::summarise(sum = sum(Abundance)) -> y 
+    print(i)
+    y %>% group_by(SampleTime) %>% summarise(mean = mean(sum)) %>% print.data.frame()
+    a <- aov(sum ~ SampleTime, y)
+    print(shapiro.test(resid(a)))
+    print(summary(a))
+    print(TukeyHSD(a))
+}
+
+core_w_time_bac %>%
+  group_by(description, SampleTime) %>%
+  summarise(mean = mean(sum)*100, se = 100*sd(sum)/sqrt(n())) %>%
+  mutate(description = ordered(description, c("Leaf Endosphere", "Leaf Surface", "Root Endosphere", "Rhizosphere")),
+         SampleTime = ordered(SampleTime, c("T0", "June", "Sept."))) %>%
+  ggplot(aes(x = SampleTime, y = mean, color = description, group = description)) +
+  geom_point(position = position_dodge(0.2)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), position = position_dodge(0.2), color = "black", width = 0.2) +
+  geom_line(size = 1, position = position_dodge(0.2)) +
+  scale_x_discrete(name = NULL) +
+  scale_y_continuous(name = "Relative Abundance (%)") +
+  scale_color_manual(values = c("darkgreen", "#8a6a11" , "#4a390a")) +
+  theme(axis.title = element_text(size = 10)) -> p_bac
+
+core_w_time_fung %>%
+  group_by(description, SampleTime) %>%
+  summarise(mean = mean(sum)*100, se = 100*sd(sum)/sqrt(n())) %>%
+  mutate(description = ordered(description, c("Leaf Endosphere", "Leaf Surface", "Root Endosphere", "Rhizosphere")),
+         SampleTime = ordered(SampleTime, c("T0", "June", "Sept."))) %>%
+  ggplot(aes(x = SampleTime, y = mean, color = description, group = description)) +
+  geom_point(position = position_dodge(0.2)) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), position = position_dodge(0.2), color = "black", width = 0.2) +
+  geom_line(size = 1, position = position_dodge(0.2)) +
+  scale_x_discrete(name = NULL) +
+  scale_y_continuous(name = "Relative Abundance (%)") +
+  scale_color_manual(values = c("lightgreen", "darkgreen","#8a6a11", "#4a390a")) +
+  theme(axis.title = element_text(size = 10)) -> p_fun
+
+prow <- plot_grid(p_bac + theme(legend.position = "none"), p_fun + theme(legend.position = "none"), ncol = 1, labels = "AUTO")
+leg <- get_legend(p_fun + theme(legend.position = "bottom", legend.justification = "center") + guides(color = guide_legend(ncol = 2)))
+prow2 <- plot_grid(prow, leg, ncol = 1, rel_heights = c(1, 0.1))
+
+eps("Fig_4.eps", height = 5, width = 3.25, units = "in", res = 300)
+prow2
+dev.off()
+```
+
+# Source tracker analysis
+```{r}
+# Find new OTUs for each time -----------------
+## 16S -------------------------
+ASV_16S_900 <- read.csv("ASV_table_16S_rarefied_900.csv", header = T, row.names = 1)
+data_16S_counts_newnames <- data_16S_counts
+sample_names(data_16S_counts_newnames)[!(substr(sample_names(data_16S_counts_newnames), 1, 1) == "E" | 
+                                           substr(sample_names(data_16S_counts_newnames), 1, 1) == "L" | 
+                                            substr(sample_names(data_16S_counts_newnames), 1, 1) == "R")] <- paste0("X", sample_names(data_16S_counts_newnames))
+data_16S_counts_900 <- merge_phyloseq(otu_table(ASV_16S_900, taxa_are_rows = T), data_16S_counts_newnames@tax_table, data_16S_counts_newnames@sam_data)
+data_16S_counts_900 <- prune_taxa(taxa_sums(data_16S_counts_900) > 0.5, data_16S_counts_900)
+
+for(i in c("Leaf Endosphere", "Root Endosphere")){
+  sub <- subset_samples(data_16S_counts_900, Description %in% i)
+  sub_May <- subset_samples(sub, SampleTime == "T0") # Subset for May
+  notMayTaxa <- prune_taxa(taxa_sums(sub_May) < 0.5, sub_May) #Find taxa not present in May
+  sub_June <- subset_samples(sub, SampleTime == "June") #Subset for June
+  NewJuneTaxa <- prune_taxa(row.names(sub_June@tax_table) %in% row.names(notMayTaxa@tax_table), sub_June) #Find taxa that are not in May
+  NewJuneTaxa.only <- prune_taxa(taxa_sums(NewJuneTaxa) > 0.5, NewJuneTaxa) # ...but are also in June
+  ammended_main_df <- prune_taxa(row.names(data_16S_counts_900@tax_table) %in% row.names(NewJuneTaxa.only@tax_table), data_16S_counts_900) #prune taxa in main df
+  ammended_main_df <- subset_samples(ammended_main_df, SampleTime !="Sept.") # subset for May & June
+  ammended_main_df@sam_data$SourceSink[ammended_main_df@sam_data$Description   %in% i]  <- "sink" # Label sink 
+  ammended_main_df@sam_data$SourceSink[!(ammended_main_df@sam_data$Description %in% i)] <- "source" # ... and source samples
+  assign(paste("NewJuneTaxa_16S", i, sep = "_"), ammended_main_df)
+}
+
+for(i in c("Leaf Endosphere", "Root Endosphere")){
+  sub <- subset_samples(data_16S_counts_900, Description %in% i)
+  sub_June <- subset_samples(sub, SampleTime == "June") # Subset for June
+  notJuneTaxa <- prune_taxa(taxa_sums(sub_June) < 0.5, sub_June) #Find taxa not present in June
+  sub_Aug <- subset_samples(sub, SampleTime == "Sept.") #Subset for Aug
+  NewAugTaxa <- prune_taxa(row.names(sub_Aug@tax_table) %in% row.names(notJuneTaxa@tax_table), sub_Aug) #Find taxa that are not in June
+  NewAugTaxa.only <- prune_taxa(taxa_sums(NewAugTaxa) > 0.5, NewAugTaxa) # ...but are also in Aug
+  ammended_main_df <- prune_taxa(row.names(data_16S_counts_900@tax_table) %in% row.names(NewAugTaxa.only@tax_table), data_16S_counts_900) #prune taxa in main df
+  ammended_main_df <- subset_samples(ammended_main_df, SampleTime != "T0") # subset for June & Aug
+  ammended_main_df <- subset_samples(ammended_main_df, SampleTime != "June" | !(Description %in% i)) # remove May sink samples
+  ammended_main_df@sam_data$SourceSink[ammended_main_df@sam_data$Description   %in% i]  <- "sink" # Label sink 
+  ammended_main_df@sam_data$SourceSink[!(ammended_main_df@sam_data$Description %in% i)] <- "source" # ... and source samples
+  assign(paste("NewAugTaxa_16S", i, sep = "_"), ammended_main_df)
+}
+
+## ITS -------------------------
+OTU_ITS_900 <- read.csv("ASV_table_ITS_rarefied_900.csv", row.names = "X")
+data_ITS_counts_newnames <- data_ITS_counts
+sample_names(data_ITS_counts_newnames)[!(substr(sample_names(data_ITS_counts_newnames), 1, 1) == "E" | 
+                                           substr(sample_names(data_ITS_counts_newnames), 1, 1) == "L")] <- paste0("X", sample_names(data_ITS_counts_newnames))
+data_ITS_counts_900 <- merge_phyloseq(otu_table(OTU_ITS_900, taxa_are_rows = T), data_ITS_counts_newnames@tax_table, data_ITS_counts_newnames@sam_data)
+data_ITS_counts_900 <- prune_taxa(taxa_sums(data_ITS_counts_900) > 0.5, data_ITS_counts_900)
+
+for(i in c("Leaf Endosphere", "Root Endosphere")){
+  sub <- subset_samples(data_ITS_counts_900, Description %in% i)
+  sub_May <- subset_samples(sub, SampleTime == "T0") 
+  notMayTaxa <- prune_taxa(taxa_sums(sub_May) < 0.5, sub_May) 
+  sub_June <- subset_samples(sub, SampleTime == "June") 
+  NewJuneTaxa <- prune_taxa(row.names(sub_June@tax_table) %in% row.names(notMayTaxa@tax_table), sub_June) 
+  NewJuneTaxa.only <- prune_taxa(taxa_sums(NewJuneTaxa) > 0.5, NewJuneTaxa) 
+  ammended_main_df <- prune_taxa(row.names(data_ITS_counts_900@tax_table) %in% row.names(NewJuneTaxa.only@tax_table), data_ITS_counts_900)
+  ammended_main_df <- subset_samples(ammended_main_df, SampleTime !="Sept.") 
+  ammended_main_df@sam_data$SourceSink[ammended_main_df@sam_data$Description   %in% i]  <- "sink" 
+  ammended_main_df@sam_data$SourceSink[!(ammended_main_df@sam_data$Description %in% i)] <- "source" 
+  assign(paste("NewJuneTaxa_ITS", i, sep = "_"), ammended_main_df)
+}
+
+for(i in c("Leaf Endosphere", "Root Endosphere")){
+  sub <- subset_samples(data_ITS_counts_900, Description %in% i)
+  sub_June <- subset_samples(sub, SampleTime == "June") 
+  notJuneTaxa <- prune_taxa(taxa_sums(sub_June) < 0.5, sub_June) 
+  sub_Aug <- subset_samples(sub, SampleTime == "Sept.") 
+  NewAugTaxa <- prune_taxa(row.names(sub_Aug@tax_table) %in% row.names(notJuneTaxa@tax_table), sub_Aug) 
+  NewAugTaxa.only <- prune_taxa(taxa_sums(NewAugTaxa) > 0.5, NewAugTaxa) 
+  ammended_main_df <- prune_taxa(row.names(data_ITS_counts_900@tax_table) %in% row.names(NewAugTaxa.only@tax_table), data_ITS_counts_900)
+  ammended_main_df <- subset_samples(ammended_main_df, SampleTime != "T0") 
+  ammended_main_df <- subset_samples(ammended_main_df, SampleTime != "June" | !(Description %in% i)) 
+  ammended_main_df@sam_data$SourceSink[ammended_main_df@sam_data$Description   %in% i]  <- "sink" 
+  ammended_main_df@sam_data$SourceSink[!(ammended_main_df@sam_data$Description %in% i)] <- "source" 
+  assign(paste("NewAugTaxa_ITS", i, sep = "_"), ammended_main_df)
+}
+
+
+#Set up inputs for source tracker --------------
+ST_dfs <- list(`NewJuneTaxa_16S_Leaf Endosphere`, `NewJuneTaxa_16S_Root Endosphere`, 
+               `NewAugTaxa_16S_Leaf Endosphere`, `NewAugTaxa_16S_Root Endosphere`,
+               `NewJuneTaxa_ITS_Leaf Endosphere`, `NewJuneTaxa_ITS_Root Endosphere`, 
+               `NewAugTaxa_ITS_Leaf Endosphere`, `NewAugTaxa_ITS_Root Endosphere`)
+names(ST_dfs) <- c("NewJunTaxa_16S_LE", "NewJunTaxa_16S_RE", "NewAugTaxa_16S_LE", "NewAugTaxa_16S_RE",
+                  "NewJunTaxa_ITS_LE", "NewJunTaxa_ITS_RE", "NewAugTaxa_ITS_LE", "NewAugTaxa_ITS_RE")
+
+# Run source tracker for each input ----------------
+ST_result <- data.frame()
+for(i in 1:length(ST_dfs)){
+  xx <- apply(otu_table(ST_dfs[[i]]),2, function(x) max(x))
+  ST_dfs[[i]]@sam_data$Omit2 <- xx
+  df.new <- subset_samples(ST_dfs[[i]], SourceSink != "sink" | Omit2 > 0.5)
+  
+  otu <- as(otu_table(df.new), "matrix")
+  otu <- t(as.data.frame(otu))
+  
+  metadata <- as(sample_data(df.new), "matrix")
+  metadata <- as.data.frame(metadata)
+  
+  # extract the source environments and source/sink indices
+  train.ix <- which(metadata$SourceSink == 'source')
+  test.ix <- which(metadata$SourceSink == 'sink')
+  envs <- metadata$Description
+  
+  alpha1 <- alpha2 <- 0.001
+  
+  # train SourceTracker object on training data
+  st <- sourcetracker(otu[train.ix,], envs[train.ix])
+  
+  # Estimate source proportions in test data
+  results <- predict(st, otu[test.ix,], alpha1=alpha1, alpha2=alpha2)
+  
+  gathered_data <- gather(as.data.frame(results$proportions), key = "Source", value = "Proportion")
+  gathered_data$Amplicon <- substr(names(ST_dfs[i]), 12, 14)
+  gathered_data$SampleTime <- substr(names(ST_dfs[i]), 4, 6)
+  gathered_data$Description <- substr(names(ST_dfs[i]), 16, 17)
+  
+  ST_result <- rbind(ST_result, gathered_data)
+}
+
+ST_result <- ST_result[,-1]
+ST_result$Description <- dplyr::recode(ST_result$Description, "LE" = "Leaf Endosphere", "RE" = "Root Endosphere")
+ST_result$Description <- ordered(ST_result$Description, c("Leaf Endosphere", "Root Endosphere"))
+ST_result$SampleTime <- dplyr::recode(ST_result$SampleTime, Jun = "June", Aug = "Sept.")
+ST_result$SampleTime <- ordered(ST_result$SampleTime, c("June", "Sept."))
+ST_result$Source <- dplyr::recode(ST_result$Source, "Leafendosphere" = "Leaf Endosphere", 
+                                             "Leaf Wash" = "Leaf Surface", 
+                                             "Rootendosphere" = "Root Endosphere")
+ST_result$Source <- ordered(ST_result$Source, c("Leaf Endosphere", "Leaf Surface","Rhizosphere", 
+                                                "Root Endosphere",  "Unknown"))
+ST_result$Amplicon <- dplyr::recode(ST_result$Amplicon, "16S" = "Archaea/Bacteria", "6S_" = "Archaea/Bacteria", "ITS" = "Fungi")
+
+x <- aov(log(Proportion*100 +1) ~ SampleTime:Source, ST_result %>% 
+           filter(Description == "Leaf Endosphere" & Amplicon == "Archaea/Bacteria" & Source != "Unknown"))
+plot(x) #plots look good
+summary(x) # interaction: p = 0.002
+marginal <- lsmeans(x, ~ SampleTime:Source)
+a <- cld(marginal, alpha = 0.05, Letters = "abcdef", adjust = "tukey")
+
+x <- aov(log(Proportion*100 +1) ~ SampleTime:Source, ST_result %>% 
+           filter(Description == "Root Endosphere" & Amplicon == "Archaea/Bacteria" & Source != "Unknown"))
+plot(x) #plots look good
+summary(x) # Only a main effect of source (p < 0.001), interaction: p = 0.230
+marginal <- lsmeans(x, ~ SampleTime:Source)
+b <- cld(marginal, alpha = 0.05, Letters = "abcdef", adjust = "tukey")
+
+x <- aov(log(Proportion*100 +1) ~ SampleTime:Source, ST_result %>% 
+           filter(Description == "Leaf Endosphere" & Amplicon == "Fungi" & Source != "Unknown"))
+plot(x) #plots look good
+summary(x) # interaction only (p = 0.003)
+marginal <- lsmeans(x, ~ SampleTime:Source)
+c <- cld(marginal, alpha = 0.05, Letters = "abcdef", adjust = "fdr")
+
+x <- aov(log(Proportion*100 +1) ~ SampleTime:Source, ST_result %>% 
+           filter(Description == "Root Endosphere" & Amplicon == "Fungi" & Source != "Unknown"))
+plot(x) #plots look good
+summary(x) # Everything sig., interaction: p = 0.004
+marginal <- lsmeans(x, ~ SampleTime:Source)
+d <- cld(marginal, alpha = 0.05, Letters = "abcdef", adjust = "tukey")
+```
+
+
+```{r}
+# 16S -------------------------------------
+nti <- read.csv("weighted_bNTI_16S.csv", row.names = 1)
+rc <- read.csv("RCoutput_rc_16S_all.csv", header=1, row.names=1, check.names=FALSE)
+
+metadata_16S <- read.csv("metadata_table_16S.csv")
+metadata_16S$HostSpecies <- "trichocarpa"
+metadata_16S$HostSpecies[substr(metadata_16S$Genotype, 1, 2) == "DD"] <- "deltoides"
+
+metadata_16S$`#SampleID`[!(substr(metadata_16S$`#SampleID`, 1, 1) == "E" | 
+                             substr(metadata_16S$`#SampleID`, 1, 1) == "L" | 
+                             substr(metadata_16S$`#SampleID`, 1, 1) == "R")] <- paste0("X", metadata_16S$`#SampleID`)
+metadata_16S$X.Sample.ID <- metadata_16S$`#SampleID`=
+
+nti <- as.matrix(nti)
+# Function to extract pairwise value from a n*n lower trianglar matrix
+nti <- data.frame(as.table(nti))[lower.tri(nti, diag = FALSE), ]
+cat("the mean beta-NTI is:", round(mean(na.omit(nti$Freq)),2), "\n")
+row.names(nti) <- paste(nti$Var1, nti$Var2, sep = "_")
+str(nti)
+
+rc <- as.matrix(rc)
+rc <- data.frame(as.table(rc))[lower.tri(rc, diag = FALSE), ]
+cat("the mean RC-bray is:", round(mean(na.omit(rc$Freq)),2), "\n")
+row.names(rc) <- paste(rc$Var1, rc$Var2, sep = "_")
+str(rc)
+
+nti.rc <- merge(nti, rc, by=0, all=F)  # merge by row names (by=0 or by="row.names")
+nti.rc <- data.frame(nti = nti.rc$Freq.x, rc = nti.rc$Freq.y, row.names = nti.rc$Row.names) 
+nti.rc$Process <- "exp"
+nti.rc$Sample1 <- sapply(strsplit(as.character(row.names(nti.rc)), "_"), `[`, 1)
+nti.rc$Sample2 <- sapply(strsplit(as.character(row.names(nti.rc)), "_"), `[`, 2)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(Description, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hab1 = Description)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(Description, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hab2 = Description)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(SampleTime, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(time1 = SampleTime)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(SampleTime, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(time2 = SampleTime)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(Genotype, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(genotype1 = Genotype)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(Genotype, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(genotype2 = Genotype)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(HostSpecies, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hostspecies1 = HostSpecies)
+nti.rc <- merge(nti.rc, metadata_16S %>% dplyr::select(HostSpecies, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hostspecies2 = HostSpecies)
+nti.rc$Process[nti.rc$nti >= 2] <- "Variable Selection"
+nti.rc$Process[nti.rc$nti <= -2] <- "Homogeneous Selection"
+nti.rc$Process[abs(nti.rc$nti) < 2 & nti.rc$rc >= 0.95] <- "Dispersal Limitation"
+nti.rc$Process[abs(nti.rc$nti) < 2 & nti.rc$rc <= -0.95] <- "Homogenizing Dispersal"
+nti.rc$Process[abs(nti.rc$nti) < 2 & abs(nti.rc$rc) < 0.95] <- "Undominated"
+dim(nti.rc)
+
+## overall pie chart ----------------
+nti.rc %>% 
+  group_by(Process) %>% 
+  tally() %>%
+  mutate(Process = ordered(Process, c("Variable Selection", "Undominated", "Homogenizing Dispersal", 
+                                      "Homogeneous Selection", "Dispersal Limitation"))) %>%
+  mutate(Process = ordered(Process, c("Undominated", "Homogenizing Dispersal", "Dispersal Limitation","Homogeneous Selection", "Variable Selection"))) %>%
+  arrange(Process) %>%
+  mutate(cumulative = cumsum(n),
+         midpoint = cumulative - n / 2,
+         label = paste0(round(n / sum(n) * 100, 1), "%")) %>%
+  mutate(Process = ordered(Process, c("Variable Selection", "Homogeneous Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = "", y = n, fill = Process, label = label)) +
+  geom_bar(stat = "identity", width = 1, position = "stack") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) + 
+  coord_polar("y", start = 0)  +
+  theme_nothing() +
+  theme(axis.text.x=element_blank()) +
+  geom_label_repel(aes(x = 1.3, y = midpoint), fill = "white") -> p22
+
+## results for 3-way interaction ---------------------------------------------------------
+nti.rc$int <- interaction(nti.rc$hab1, nti.rc$time1, nti.rc$genotype1)
+int <- nti.rc %>% filter(hab1 == hab2 & time1 == time2 & genotype1 == genotype2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$int)))){
+  sub <- subset(int, int %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+a <- aov(nti ~ hab1*time1*genotype1, int)
+shapiro.test(resid(a)) 
+summary(a) 
+
+## results for 3-way interaction with host species instead of genotype---------------------------------------------------------
+nti.rc$int <- interaction(nti.rc$hab1, nti.rc$time1, nti.rc$hostspecies1)
+int <- nti.rc %>% filter(hab1 == hab2 & time1 == time2 & hostspecies1 == hostspecies2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$int)))){
+  sub <- subset(int, int %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+
+### Test for genotyope effect for each sampletime habitat combination ----------------------
+int$cbn <- interaction(int$hab1, int$time1)
+for(i in levels(as.factor(as.character(int$cbn)))){
+  sub <- int %>% filter(cbn %in% i)
+  if(nrow(sub) > length(levels(as.factor(as.character(sub$genotype1))))){
+    a <- aov(nti ~ genotype1, int %>% filter(cbn %in% i))
+    print(i)
+    print(p.adjust(summary(a)[[1]][[1,"Pr(>F)"]], n = 8, method = "fdr"))
+  }
+} 
+
+## results for 2-way habitat-sampletime interaction ---------------------------------------------------------
+nti.rc$int <- interaction(nti.rc$hab1, nti.rc$time1)
+int <- nti.rc %>% filter(hab1 == hab2 & time1 == time2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$int)))){
+  sub <- subset(int, int %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+a <- aov(nti ~ hab1*time1, int)
+shapiro.test(resid(a)) 
+summary(a) 
+
+### Test for  sampletime in each habitat  ----------------------
+for(i in levels(as.factor(as.character(int$hab1)))){
+  sub <- int %>% filter(hab1 %in% i)
+  if(nrow(sub) > length(levels(as.factor(as.character(sub$time1))))){
+    a <- aov(nti ~ time1, int %>% filter(hab1 %in% i))
+    print(i)
+    print(p.adjust(summary(a)[[1]][[1,"Pr(>F)"]], n = 4, method = "fdr"))
+  }
+} 
+
+### Test for differences among habitats ----------------
+int <- nti.rc %>% filter(hab1 == hab2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("hab1", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$hab1)))){
+  sub <- subset(int, hab1 %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("hab1", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+a <- aov(nti ~ hab1*time1, int)
+shapiro.test(resid(a)) 
+summary(a)
+
+### Test for the relationship between the exo and endo
+nti.rc_rhizo <- nti.rc %>% filter(hab1 == "Rhizosphere" & hab2  == "Rootendosphere")
+nti.rc_rhizo2 <- nti.rc %>% filter(hab1 == "Rootendosphere" & hab2  == "Rhizosphere")
+nti.rc_rhizo <- rbind(nti.rc_rhizo, nti.rc_rhizo2)
+
+nti.rc_rhizo %>%
+  group_by(Process) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n) * 100) -> tab
+
+nti.rc_rhizo %>%
+  group_by(Process, time1) %>%
+  summarise(n = n()) -> tab
+
+tab %>% group_by(time1) %>% summarise(total = sum(n)) -> total
+
+tab <- merge(tab, total, by = "time1") %>% mutate(freq = n/total*100)
+
+tab %>%
+  mutate(time1 = dplyr::recode(time1, "0" = "T0", "1" = "June", "2" = "Sept."),
+         time1 = ordered(time1, c("T0", "June", "Sept.")),
+         Process = ordered(Process, c("Variable Selection", "Homogeneous Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = time1, y = freq, fill = Process)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) +
+  labs(x = NULL, y = "Percent") -> P_16S_belowground
+
+nti.rc_leaf <- nti.rc %>% filter(hab1 == "Leafwash" & hab2  == "Leafendosphere")
+nti.rc_leaf2 <- nti.rc %>% filter(hab1 == "Leafendosphere" & hab2  == "Leafwash")
+nti.rc_leaf <- rbind(nti.rc_leaf, nti.rc_leaf2)
+
+nti.rc_leaf %>%
+  group_by(Process) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n) * 100) -> tab
+
+nti.rc_leaf %>%
+  group_by(Process, time1) %>%
+  summarise(n = n()) -> tab
+
+tab %>% group_by(time1) %>% summarise(total = sum(n)) -> total
+
+tab <- merge(tab, total, by = "time1") %>% mutate(freq = n/total*100)
+
+tab %>%
+  mutate(time1 = dplyr::recode(time1, "0" = "T0", "1" = "June", "2" = "Sept."),
+         time1 = ordered(time1, c("T0", "June", "Sept.")),
+         Process = ordered(Process, c("Variable Selection", "Homogeneous Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = time1, y = freq, fill = Process)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) +
+  labs(x = NULL, y = "Percent") -> p_16S_aboveground
+
+### Plot area plots ------------------------
+theme_update(axis.title = element_text(size = 20), axis.text = element_text(size = 18), legend.text = element_text(size = 18), 
+             strip.text = element_text(size = 18), legend.justification = "center")
+
+tab.int$Description <- sapply(strsplit(as.character(tab.int$int), "[.]"), `[`, 1)
+tab.int$SampleTime <- sapply(strsplit(as.character(tab.int$int), "[.]"), `[`, 2)  
+tab.int %>% na.omit() %>%
+  mutate(Description = dplyr::recode(Description, 
+                                     Leafendosphere = "Leaf Endosphere", Leafwash = "Leaf Surface", Rootendosphere = "Root Endosphere"),
+         Description = ordered(Description, c("Leaf Endosphere", "Leaf Surface", "Root Endosphere", "Rhizosphere")),
+         SampleTime = dplyr::recode(SampleTime, "0" = "T0", "1" = "June", "2" = "Sept."),
+         SampleTime = ordered(SampleTime, c("T0", "June", "Sept."))) %>%
+  dplyr::select(-int, -mean.nti, -se.nti, -mean.rc, -se.rc) %>%
+  gather(key = "Process", value = "Percent", -Description, -SampleTime) %>%
+  mutate(Process = dplyr::recode(Process, percent.DL = "Dispersal Limitation", percent.HD = "Homogenizing Dispersal", 
+                                 percent.HS = "Homogenizing Selection", percent.VS = "Variable Selection", percent.UD = "Undominated"),
+         Process = ordered(Process, c("Variable Selection", "Homogenizing Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = SampleTime, y = Percent, fill = Process)) +
+  geom_bar(position = "stack", stat = "identity") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) +
+  facet_wrap(~Description) +
+  scale_x_discrete(name = NULL) +
+  #theme(legend.text = element_text(size = 10)) +
+  guides(fill = guide_legend(ncol = 2)) -> p
+
+# ITS ----------------------------------------------------------
+nti <- read.csv("weighted_bNTI_ITS.csv", row.names = 1)
+rc <- read.csv("RCoutput_rc_ITS.csv", header=1, row.names=1, check.names=FALSE)
+
+metadata_ITS <- read.csv("metadata_table_ITS.csv")
+metadata_ITS$HostSpecies <- "trichocarpa"
+metadata_ITS$HostSpecies[substr(metadata_ITS$Genotype, 1, 2) == "DD"] <- "deltoides"
+
+metadata_ITS$X.Sample.ID[!(substr(metadata_ITS$X.Sample.ID, 1, 1) == "E" | 
+                             substr(metadata_ITS$X.Sample.ID, 1, 1) == "L" | 
+                             substr(metadata_ITS$X.Sample.ID, 1, 1) == "R")] <- paste0("X", metadata_ITS$X.Sample.ID)
+metadata_ITS$SampleTime <- as.character(metadata_ITS$SampleTime)
+
+nti <- as.matrix(nti)
+# Function to extract pairwise value from a n*n lower trianglar matrix
+nti <- data.frame(as.table(nti))[lower.tri(nti, diag = FALSE), ]
+cat("the mean beta-NTI is:", round(mean(na.omit(nti$Freq)),2), "\n")
+row.names(nti) <- paste(nti$Var1, nti$Var2, sep = "_")
+str(nti)
+
+rc <- as.matrix(rc)
+rc <- data.frame(as.table(rc))[lower.tri(rc, diag = FALSE), ]
+cat("the mean RC-bray is:", round(mean(na.omit(rc$Freq)),2), "\n")
+row.names(rc) <- paste(rc$Var1, rc$Var2, sep = "_")
+str(rc)
+
+nti.rc <- merge(nti, rc, by=0, all=F)  # merge by row names (by=0 or by="row.names")
+nti.rc <- data.frame(nti = nti.rc$Freq.x, rc = nti.rc$Freq.y, row.names = nti.rc$Row.names) 
+nti.rc$Process <- "exp"
+nti.rc$Sample1 <- sapply(strsplit(as.character(row.names(nti.rc)), "_"), `[`, 1)
+nti.rc$Sample2 <- sapply(strsplit(as.character(row.names(nti.rc)), "_"), `[`, 2)
+nti.rc <- merge(nti.rc, metadata_ITS %>% 
+                  dplyr::select(Description, X.Sample.ID), 
+                by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hab1 = Description)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(Description, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hab2 = Description)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(SampleTime, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(time1 = SampleTime)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(SampleTime, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(time2 = SampleTime)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(Genotype, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(genotype1 = Genotype)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(Genotype, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(genotype2 = Genotype)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(HostSpecies, X.Sample.ID), by.x = "Sample1", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hostspecies1 = HostSpecies)
+nti.rc <- merge(nti.rc, metadata_ITS %>% dplyr::select(HostSpecies, X.Sample.ID), by.x = "Sample2", by.y = "X.Sample.ID") %>% 
+  dplyr::rename(hostspecies2 = HostSpecies)
+nti.rc$Process[nti.rc$nti >= 2] <- "Variable Selection"
+nti.rc$Process[nti.rc$nti <= -2] <- "Homogeneous Selection"
+nti.rc$Process[abs(nti.rc$nti) < 2 & nti.rc$rc >= 0.95] <- "Dispersal Limitation"
+nti.rc$Process[abs(nti.rc$nti) < 2 & nti.rc$rc <= -0.95] <- "Homogenizing Dispersal"
+nti.rc$Process[abs(nti.rc$nti) < 2 & abs(nti.rc$rc) < 0.95] <- "Undominated"
+dim(nti.rc)
+
+# overall pie chart ----------------
+nti.rc %>% 
+  group_by(Process) %>% 
+  tally() %>%
+  mutate(Process = ordered(Process, c("Variable Selection", "Undominated", "Homogenizing Dispersal", 
+                                      "Homogeneous Selection", "Dispersal Limitation"))) %>%
+  mutate(Process = ordered(Process, c("Undominated", "Homogenizing Dispersal", "Dispersal Limitation","Homogeneous Selection", "Variable Selection"))) %>%
+  arrange(Process) %>%
+  mutate(cumulative = cumsum(n),
+         midpoint = cumulative - n / 2,
+         label = paste0(round(n / sum(n) * 100, 1), "%")) %>%
+  mutate(Process = ordered(Process, c("Variable Selection", "Homogeneous Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = "", y = n, fill = Process, label = label)) +
+  geom_bar(stat = "identity", width = 1, position = "stack") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) + 
+  coord_polar("y", start = 0)  +
+  theme_nothing() +
+  theme(axis.text.x=element_blank()) +
+  geom_label_repel(aes(x = 1.3, y = midpoint), fill = "white") -> p23
+
+# results for 3-way interaction ---------------------------------------------------------
+nti.rc$int <- interaction(nti.rc$hab1, nti.rc$time1, nti.rc$genotype1)
+int <- nti.rc %>% filter(hab1 == hab2 & time1 == time2 & genotype1 == genotype2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$int)))){
+  sub <- subset(int, int %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+a <- aov(nti ~ hab1*time1*genotype1, int)
+shapiro.test(resid(a)) 
+summary(a) 
+
+# results for 3-way interaction with host species instead of genotype---------------------------------------------------------
+nti.rc$int <- interaction(nti.rc$hab1, nti.rc$time1, nti.rc$hostspecies1)
+int <- nti.rc %>% filter(hab1 == hab2 & time1 == time2 & hostspecies1 == hostspecies2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$int)))){
+  sub <- subset(int, int %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+
+## Test for genotyope effect for each sampletime habitat combination ----------------------
+int$cbn <- interaction(int$hab1, int$time1)
+for(i in levels(as.factor(as.character(int$cbn)))){
+  sub <- int %>% filter(cbn %in% i)
+  if(nrow(sub) > length(levels(as.factor(as.character(sub$genotype1))))){
+    a <- aov(nti ~ genotype1, int %>% filter(cbn %in% i))
+    print(i)
+    print(p.adjust(summary(a)[[1]][[1,"Pr(>F)"]], n = 7, method = "fdr"))
+  }
+} 
+
+# results for 2-way habitat-sampletime interaction ---------------------------------------------------------
+nti.rc$int <- interaction(nti.rc$hab1, nti.rc$time1)
+int <- nti.rc %>% filter(hab1 == hab2 & time1 == time2)
+tab.int <- data.frame(matrix(ncol = 10))
+colnames(tab.int) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+for(i in levels(as.factor(as.character(int$int)))){
+  sub <- subset(int, int %in% i)
+  mean.nti <- mean(sub$nti)
+  se.nti <- sd(sub$nti)/sqrt(nrow(sub))
+  mean.rc <- mean(sub$rc)
+  se.rc <- sd(sub$rc)/sqrt(nrow(sub))
+  percent.VS <- round(100*(sub %>% filter(Process == "Variable Selection") %>% tally())/nrow(sub), 0)
+  percent.HS <- round(100*(sub %>% filter(Process == "Homogeneous Selection") %>% tally())/nrow(sub), 0)
+  percent.DL <- round(100*(sub %>% filter(Process == "Dispersal Limitation") %>% tally())/nrow(sub), 0)
+  percent.HD <- round(100*(sub %>% filter(Process == "Homogenizing Dispersal") %>% tally())/nrow(sub), 0)
+  percent.UD <- round(100*(sub %>% filter(Process == "Undominated") %>% tally())/nrow(sub), 0)
+  x <- cbind(i, mean.nti, se.nti, mean.rc, se.rc, percent.VS, percent.HS, percent.DL, percent.HD, percent.UD)
+  colnames(x) <- c("int", "mean.nti", "se.nti", "mean.rc", "se.rc", "percent.VS", "percent.HS", "percent.DL", "percent.HD", "percent.UD")
+  tab.int <- rbind(tab.int, x)
+}
+a <- aov(nti ~ hab1*time1, int)
+shapiro.test(resid(a)) 
+summary(a) 
+
+## Test for  sampletime in each habitat  ----------------------
+for(i in levels(as.factor(as.character(int$hab1)))){
+  sub <- int %>% filter(hab1 %in% i)
+  if(nrow(sub) > length(levels(as.factor(as.character(sub$time1))))){
+    a <- aov(nti ~ time1, int %>% filter(hab1 %in% i))
+    print(i)
+    print(p.adjust(summary(a)[[1]][[1,"Pr(>F)"]], n = 4, method = "fdr"))
+  }
+} 
+
+## Plot area plots ------------------------
+tab.int$Description <- sapply(strsplit(as.character(tab.int$int), "[.]"), `[`, 1)
+tab.int$SampleTime <- sapply(strsplit(as.character(tab.int$int), "[.]"), `[`, 2)  
+tab.int %>% na.omit() %>%
+  mutate(Description = dplyr::recode(Description, Leafendosphere = "Leaf Endosphere", Leafwash = "Leaf Surface", Rootendosphere = "Root Endosphere"),
+         Description = ordered(Description, c("Leaf Endosphere", "Leaf Surface", "Root Endosphere", "Rhizosphere")),
+         SampleTime = dplyr::recode(SampleTime, "0" = "T0", "1" = "June", "2" = "Sept."),
+         SampleTime = ordered(SampleTime, c("T0", "June", "Sept."))) %>%
+  dplyr::select(-int, -mean.nti, -se.nti, -mean.rc, -se.rc) %>%
+  gather(key = "Process", value = "Percent", -Description, -SampleTime) %>%
+  mutate(Process = dplyr::recode(Process, percent.DL = "Dispersal Limitation", percent.HD = "Homogenizing Dispersal", 
+                                 percent.HS = "Homogenizing Selection", percent.VS = "Variable Selection", percent.UD = "Undominated"),
+         Process = ordered(Process, c("Variable Selection", "Homogenizing Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = SampleTime, y = Percent, fill = Process)) +
+  geom_bar(position = "stack", stat = "identity") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) +
+  facet_wrap(~Description) +
+  scale_x_discrete(name = NULL) +
+  #theme(legend.text = element_text(size = 10)) +
+  guides(fill = guide_legend(ncol = 2)) -> p3
+
+## Test for the relationship between the exo and endo
+nti.rc_rhizo <- nti.rc %>% filter(hab1 == "Rhizosphere" & hab2  == "Rootendosphere")
+nti.rc_rhizo2 <- nti.rc %>% filter(hab1 == "Rootendosphere" & hab2  == "Rhizosphere")
+nti.rc_rhizo <- rbind(nti.rc_rhizo, nti.rc_rhizo2)
+
+nti.rc_rhizo %>%
+  group_by(Process) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n) * 100) -> tab
+
+nti.rc_rhizo %>%
+  group_by(Process, time1) %>%
+  summarise(n = n()) -> tab
+
+tab %>% group_by(time1) %>% summarise(total = sum(n)) -> total
+
+tab <- merge(tab, total, by = "time1") %>% mutate(freq = n/total*100)
+
+tab %>%
+  mutate(time1 = dplyr::recode(time1, "0" = "T0", "1" = "June", "2" = "Sept."),
+         time1 = ordered(time1, c("T0", "June", "Sept.")),
+         Process = ordered(Process, c("Variable Selection", "Homogeneous Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = time1, y = freq, fill = Process)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("#a3210a", "#edb1a6", "#0b6596", "#a6d4ed", "gray")) +
+  labs(x = NULL, y = "Percent") -> P_ITS_belowground
+
+nti.rc_leaf <- nti.rc %>% filter(hab1 == "Leafwash" & hab2  == "Leafendosphere")
+nti.rc_leaf2 <- nti.rc %>% filter(hab1 == "Leafendosphere" & hab2  == "Leafwash")
+nti.rc_leaf <- rbind(nti.rc_leaf, nti.rc_leaf2)
+
+nti.rc_leaf %>%
+  group_by(Process) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n) * 100) -> tab
+
+nti.rc_leaf %>%
+  group_by(Process, time1) %>%
+  summarise(n = n()) -> tab
+
+tab %>% group_by(time1) %>% summarise(total = sum(n)) -> total
+
+tab <- merge(tab, total, by = "time1") %>% mutate(freq = n/total*100)
+
+tab %>%
+  mutate(time1 = dplyr::recode(time1, "0" = "T0", "1" = "June", "2" = "Sept."),
+         time1 = ordered(time1, c("T0", "June", "Sept.")),
+         Process = ordered(Process, c("Variable Selection", "Homogeneous Selection", "Dispersal Limitation", 
+                                      "Homogenizing Dispersal", "Undominated"))) %>%
+  ggplot(aes(x = time1, y = freq, fill = Process)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("#edb1a6", "#0b6596", "#a6d4ed", "gray")) +
+  labs(x = NULL, y = "Percent") -> p_ITS_aboveground
+
+
+# Plots --------------------------------------------------------
+prow <- plot_grid(p22, p + theme(legend.position = "none"), p23, p3 + theme(legend.position = "none"), labels = "AUTO", rel_widths = c(1,1.2))
+prow2 <- plot_grid(prow, leg1, ncol = 1, rel_heights = c(1, 0.1))
+
+eps("Fig_4.eps", res = 300, height = 6.5, width = 7, units = "in")
+prow2
+dev.off()
+
+prow <- plot_grid(p_16S_aboveground + theme(legend.position = "none"), 
+                  P_16S_belowground + theme(legend.position = "none"),
+                  p_ITS_aboveground + theme(legend.position = "none"),
+                  P_ITS_belowground + theme(legend.position = "none"),
+                  ncol = 2, align = "vh", labels = "AUTO")
+leg <- get_legend(p_16S_aboveground + theme(legend.title = element_blank()))
+prow2 <- plot_grid(prow, leg, ncol = 2, rel_widths = c(1, 0.5))
+
+eps("Fig_S7.eps", res = 300, height = 5, width = 6.5, units = "in")
+prow2
+dev.off()
+```
+
