@@ -13,4 +13,6 @@ In Review.
 
 - Or use my pre-made feature, taxonomy, and metadata tables found in this repository
 
+- Inputs and outputs for community assembly models can be found in the Data folder. However, code can be found at <a href="https://github.com/stegen/Stegen_etal_ISME_2013"></a>
+
 - Please contact Nicholas Dove (dovenc@ornl.gov) with any questions or comments.
