@@ -15,4 +15,4 @@ In Review.
 
 - Inputs and outputs for community assembly models can be found in the Data folder. However, code to conduct these models can be found at <a href="https://github.com/stegen/Stegen_etal_ISME_2013">https://github.com/stegen/Stegen_etal_ISME_2013</a>. For this dataset, these models should be run on multiple nodes with high numbers of CPUs and memory (i.e., don't run these models on your local machine with such a large dataset).
 
-- Please contact Nicholas Dove (dovenc@ornl.gov) with any questions or comments.
+- Please contact Nicholas Dove (dovenc@ornl.gov) with any questions or comments. I'm always happy to help :).
