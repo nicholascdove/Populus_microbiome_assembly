@@ -1792,8 +1792,14 @@ marginal <- lsmeans(x, ~ SampleTime:Source)
 d <- cld(marginal, alpha = 0.05, Letters = "abcdef", adjust = "tukey")
 ```
 
-
+ # Null Model analysis
 ```{r}
+
+###
+# Use scripts from Stegen et al. (2013) and inputs on my github to create precoursors to this analysis, or just use the pre-created outputs
+####
+
+
 # 16S -------------------------------------
 nti <- read.csv("weighted_bNTI_16S.csv", row.names = 1)
 rc <- read.csv("RCoutput_rc_16S_all.csv", header=1, row.names=1, check.names=FALSE)
