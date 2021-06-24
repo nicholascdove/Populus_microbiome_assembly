@@ -7,7 +7,7 @@ Nicholas C. Dove<sup>1</sup>, Allison M. Veach<sup>1</sup>, Wellington Muchero<s
 <sup>3</sup>Department of Microbiology, The University of Tennessee, Knoxville, Knoxville, TN, United States<br>
 <sup>4</sup>Department of Ecology & Evolutionary Biology, The University of Tennessee, Knoxville, Knoxville, TN, United States<br>
 
-In Review.
+mSphere, 09 June 2021 | <a href="https://doi.org/10.1128/mSphere.01316-20">https://doi.org/10.1128/mSphere.01316-20</a>
 
 - Raw data can be found in the Sequence Read Archive under project ID <a href="http://www.ncbi.nlm.nih.gov/bioproject/685817">685817</a>.
 
